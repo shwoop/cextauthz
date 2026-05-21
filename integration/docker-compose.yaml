@@ -1,0 +1,16 @@
+services:
+  upstream:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+
+  envoy:
+    image: envoyproxy/envoy:v1.30-latest
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml
+      # Ensure the WASM module is built first: ./build.sh
+      - ../target/wasm32-unknown-unknown/release/cextauthz.wasm:/etc/envoy/cextauthz.wasm
+    depends_on:
+      - upstream

@@ -9,6 +9,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 proxy-wasm = "0.2"
 
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }
+
 [profile.release]
 opt-level = "z"
 lto = true
