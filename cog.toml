@@ -1,0 +1,19 @@
+# BREAKING CHANGE auto-detection:
+# Cocogitto automatically detects breaking changes via `BREAKING CHANGE:` in the
+# commit body or `!` after the type/scope (e.g. `feat!:`) and bumps MAJOR.
+# No explicit configuration is required. Note: 0.y.z versions are treated
+# specially — auto-bump will never jump to 1.0.0, even with breaking changes.
+
+tag_prefix = "v"
+
+[commit_types]
+feat = { bump_minor = true }
+fix = { bump_patch = true }
+chore = {}
+docs = {}
+style = {}
+refactor = {}
+perf = {}
+test = {}
+build = {}
+ci = {}

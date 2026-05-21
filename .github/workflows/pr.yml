@@ -1,0 +1,49 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-checks:
+    name: PR Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+
+      # cargo test is intentionally omitted: proxy-wasm host functions
+      # (e.g. _proxy_log, _proxy_add_header_map_value) are not available
+      # when linking for the native host architecture, so the test binary
+      # cannot link. We verify correctness with cargo check + WASM build.
+      - name: Run cargo check
+        run: cargo check
+
+      - name: Run cargo check (WASM)
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Build WASM release
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Install cocogitto
+        uses: cocogitto/cocogitto-action@v3
+
+      - name: Validate conventional commits
+        run: cog check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
