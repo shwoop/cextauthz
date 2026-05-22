@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,14 +37,23 @@ impl DockerCompose {
     }
 
     fn run_silent(&self, args: &[&str]) {
-        let _ = Command::new("docker")
+        if let Ok(output) = Command::new("docker")
             .arg("compose")
             .args(args)
             .current_dir(&self.dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+            .stderr(Stdio::piped())
+            .output()
+        {
+            if !output.status.success() {
+                eprintln!(
+                    "docker compose {:?} cleanup failed: {}",
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     fn down_silent(&self) {
@@ -61,7 +72,9 @@ fn wait_for_envoy(timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
     loop {
         match client.get("http://localhost:10000/").send() {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            // Envoy is ready if it responds with 200 (allowed) or 403 (denied by ext_authz).
+            // Either status means the filter chain is up and running.
+            Ok(resp) if resp.status().is_success() || resp.status() == 403 => return Ok(()),
             Ok(resp) => {
                 eprintln!(
                     "Envoy returned non-success status: {} (retrying...)",
@@ -79,9 +92,15 @@ fn wait_for_envoy(timeout: Duration) -> Result<(), String> {
     }
 }
 
+fn assert_port_free(port: u16) {
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("Port {} is already in use: {}. Cannot run integration test.", port, e));
+    // `_listener` is dropped when the function returns, right before Docker Compose starts,
+    // minimizing the race window.
+}
+
 #[test]
-fn test_envoy_wasm_filter_proxies_request() {
-    // Ensure the wasm module is built
+fn test_ext_authz_filter() {
     let wasm_path = "target/wasm32-unknown-unknown/release/cextauthz.wasm";
     assert!(
         std::path::Path::new(wasm_path).exists(),
@@ -89,19 +108,44 @@ fn test_envoy_wasm_filter_proxies_request() {
         wasm_path
     );
 
+    assert_port_free(10000);
+    assert_port_free(9000);
+    assert_port_free(8080);
+
     let _compose = DockerCompose::new("integration");
 
     wait_for_envoy(Duration::from_secs(30)).expect("Envoy failed to start");
 
-    let response = reqwest::blocking::get("http://localhost:10000/")
+    let client = reqwest::blocking::Client::new();
+
+    // Request without x-ext-authz header should be denied
+    let denied = client
+        .get("http://localhost:10000/")
+        .send()
         .expect("Failed to send request to Envoy");
 
     assert_eq!(
-        response.status(),
-        200,
-        "Expected 200 OK, got {}",
-        response.status()
+        denied.status(),
+        403,
+        "Expected 403 Forbidden without auth header, got {}",
+        denied.status()
     );
 
-    // compose is dropped here, triggering docker compose down
+    // Request with x-ext-authz: allow header should succeed
+    let allowed = client
+        .get("http://localhost:10000/")
+        .header("x-ext-authz", "allow")
+        .send()
+        .expect("Failed to send request to Envoy");
+
+    assert_eq!(
+        allowed.status(),
+        200,
+        "Expected 200 OK with auth header, got {}",
+        allowed.status()
+    );
+
+    // Note: The authz service adds x-ext-authz-check-received and
+    // x-ext-authz-additional-header-override to the upstream request (not the
+    // client response) via the gRPC OkResponse. nginx does not echo them back.
 }
