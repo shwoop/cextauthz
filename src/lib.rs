@@ -7,19 +7,39 @@ mod wasm {
     use prost::Message;
     use proxy_wasm::traits::*;
     use proxy_wasm::types::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use std::time::Duration;
 
     const GRPC_CLUSTER: &str = "ext_authz";
     const GRPC_SERVICE: &str = "envoy.service.auth.v3.Authorization";
     const GRPC_METHOD: &str = "Check";
+    const VM_ID: &str = "cextauthz_vm";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PluginRole {
+        HttpFilter,
+        Singleton,
+    }
+
+    impl Default for PluginRole {
+        fn default() -> Self {
+            Self::HttpFilter
+        }
+    }
 
     #[derive(serde::Deserialize)]
     struct PluginConfig {
+        #[serde(default)]
+        role: PluginRole,
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
         #[serde(default)]
         cache: CacheConfigJson,
+        #[serde(default)]
+        invalidation: InvalidationConfigJson,
     }
 
     #[derive(serde::Deserialize, Default)]
@@ -28,8 +48,14 @@ mod wasm {
         enabled: bool,
         #[serde(default = "default_cache_ttl_ms")]
         ttl_ms: u64,
-        #[serde(default = "default_cache_max_size")]
-        max_size: usize,
+        #[serde(default = "default_cache_size_kb")]
+        size_kb: usize,
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, Default)]
+    struct InvalidationConfigJson {
+        #[serde(default)]
+        secret: Option<String>,
     }
 
     fn default_timeout_ms() -> u64 {
@@ -38,13 +64,20 @@ mod wasm {
     fn default_cache_ttl_ms() -> u64 {
         60000
     }
-    fn default_cache_max_size() -> usize {
-        1000
+    fn default_cache_size_kb() -> usize {
+        1024
     }
 
     pub struct AuthzRoot {
+        role: PluginRole,
         timeout_ms: u64,
         cache_config: crate::cache::CacheConfig,
+        cache: Rc<RefCell<crate::cache::VmCache>>,
+        invalidation_secret: Option<String>,
+        worker_queue_name: Option<String>,
+        worker_queue_id: Option<u32>,
+        control_queue_id: Option<u32>,
+        registered_worker_queue_names: crate::invalidation::WorkerRegistry,
     }
 
     pub struct AuthzHttp {
@@ -61,14 +94,25 @@ mod wasm {
         body_buf: Vec<u8>,
         cache_config: crate::cache::CacheConfig,
         cache_key: Option<String>,
+        cache: Rc<RefCell<crate::cache::VmCache>>,
+        invalidation_secret: Option<String>,
+        control_queue_id: Option<u32>,
+        is_invalidation_request: bool,
     }
 
     proxy_wasm::main! {{
         proxy_wasm::set_log_level(LogLevel::Info);
         proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
             Box::new(AuthzRoot {
+                role: PluginRole::HttpFilter,
                 timeout_ms: 1000,
                 cache_config: crate::cache::CacheConfig::default(),
+                cache: Rc::new(RefCell::new(crate::cache::VmCache::new())),
+                invalidation_secret: None,
+                worker_queue_name: None,
+                worker_queue_id: None,
+                control_queue_id: None,
+                registered_worker_queue_names: crate::invalidation::WorkerRegistry::default(),
             })
         });
     }}
@@ -85,29 +129,39 @@ mod wasm {
             {
                 let trimmed = text.trim();
                 if let Ok(json_cfg) = serde_json::from_str::<PluginConfig>(trimmed) {
+                    self.role = json_cfg.role;
                     self.timeout_ms = json_cfg.timeout_ms;
                     self.cache_config = crate::cache::CacheConfig {
                         enabled: json_cfg.cache.enabled,
                         ttl: Duration::from_millis(json_cfg.cache.ttl_ms),
-                        max_size: json_cfg.cache.max_size,
+                        size_bytes: json_cfg.cache.size_kb.saturating_mul(1024),
                     };
+                    self.invalidation_secret = json_cfg.invalidation.secret.clone();
                     let _ = proxy_wasm::hostcalls::log(
                         LogLevel::Info,
                         &format!(
-                            "ext_authz: timeout={} ms, cache_enabled={}, cache_ttl={} ms, cache_max_size={}",
+                            "ext_authz: role={:?}, timeout={} ms, cache_enabled={}, cache_ttl={} ms, cache_size_kb={}",
+                            self.role,
                             self.timeout_ms,
                             self.cache_config.enabled,
                             json_cfg.cache.ttl_ms,
-                            self.cache_config.max_size
+                            json_cfg.cache.size_kb
                         ),
                     );
                 } else if let Ok(ms) = trimmed.parse::<u64>() {
                     // Backward compatibility: raw u64 milliseconds
-                    self.timeout_ms = ms;
-                    let _ = proxy_wasm::hostcalls::log(
-                        LogLevel::Info,
-                        &format!("ext_authz: timeout configured to {} ms", self.timeout_ms),
-                    );
+                    if self.role == PluginRole::Singleton {
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Warn,
+                            "ext_authz: raw u64 timeout config not supported for singleton; ignoring",
+                        );
+                    } else {
+                        self.timeout_ms = ms;
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Info,
+                            &format!("ext_authz: timeout configured to {} ms", self.timeout_ms),
+                        );
+                    }
                 } else {
                     let _ = proxy_wasm::hostcalls::log(
                         LogLevel::Warn,
@@ -119,10 +173,16 @@ mod wasm {
         }
 
         fn get_type(&self) -> Option<ContextType> {
-            Some(ContextType::HttpContext)
+            match self.role {
+                PluginRole::HttpFilter => Some(ContextType::HttpContext),
+                PluginRole::Singleton => None,
+            }
         }
 
         fn create_http_context(&self, _: u32) -> Option<Box<dyn HttpContext>> {
+            if self.role != PluginRole::HttpFilter {
+                return None;
+            }
             Some(Box::new(AuthzHttp {
                 grpc_token: None,
                 timeout: Duration::from_millis(self.timeout_ms),
@@ -137,6 +197,10 @@ mod wasm {
                 body_buf: Vec::new(),
                 cache_config: self.cache_config.clone(),
                 cache_key: None,
+                cache: self.cache.clone(),
+                invalidation_secret: self.invalidation_secret.clone(),
+                control_queue_id: self.control_queue_id,
+                is_invalidation_request: false,
             }))
         }
     }
