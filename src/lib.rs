@@ -510,13 +510,13 @@ mod wasm {
                 if end_of_stream {
                     return self.handle_invalidation_request();
                 }
-                return Action::Pause;
+                return Action::Continue;
             }
 
             if end_of_stream {
                 self.dispatch_check_request()
             } else {
-                Action::Pause
+                Action::Continue
             }
         }
 
@@ -535,7 +535,7 @@ mod wasm {
                 if end_of_stream {
                     return self.handle_invalidation_request();
                 }
-                return Action::Pause;
+                return Action::Continue;
             }
 
             if body_size > 0 {
@@ -547,7 +547,7 @@ mod wasm {
             if end_of_stream {
                 self.dispatch_check_request()
             } else {
-                Action::Pause
+                Action::Continue
             }
         }
 
