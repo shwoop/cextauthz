@@ -503,6 +503,16 @@ mod wasm {
                 }
             }
 
+            self.is_invalidation_request = self.method == "POST"
+                && self.path == crate::invalidation::INVALIDATION_PATH;
+
+            if self.is_invalidation_request {
+                if end_of_stream {
+                    return self.handle_invalidation_request();
+                }
+                return Action::Pause;
+            }
+
             if end_of_stream {
                 self.dispatch_check_request()
             } else {
@@ -512,6 +522,19 @@ mod wasm {
 
         fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
             if self.dispatched {
+                return Action::Pause;
+            }
+
+            if self.is_invalidation_request {
+                if body_size > 0 {
+                    if let Some(chunk) = self.get_http_request_body(0, body_size) {
+                        self.body_buf.clear();
+                        self.body_buf.extend_from_slice(&chunk);
+                    }
+                }
+                if end_of_stream {
+                    return self.handle_invalidation_request();
+                }
                 return Action::Pause;
             }
 
@@ -530,6 +553,98 @@ mod wasm {
 
         fn on_log(&mut self) {
             let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: request completed");
+        }
+    }
+
+    impl AuthzHttp {
+        fn invalidation_authorized(&self) -> bool {
+            let Some(expected) = self.invalidation_secret.as_deref() else {
+                return false;
+            };
+            self.headers
+                .get(crate::invalidation::INVALIDATION_SECRET_HEADER)
+                .map(|actual| actual == expected)
+                .unwrap_or(false)
+        }
+
+        fn handle_invalidation_request(&mut self) -> Action {
+            if !self.invalidation_authorized() {
+                self.send_http_response(
+                    401,
+                    vec![("content-type", "text/plain")],
+                    Some(b"Unauthorized"),
+                );
+                return Action::Pause;
+            }
+
+            let now_ms = self.now_ms();
+            let request = match crate::invalidation::parse_invalidation(&self.body_buf, now_ms) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = proxy_wasm::hostcalls::log(
+                        LogLevel::Warn,
+                        &format!("ext_authz: invalid invalidation request: {:?}", error),
+                    );
+                    self.send_http_response(
+                        400,
+                        vec![("content-type", "text/plain")],
+                        Some(b"Bad invalidation request"),
+                    );
+                    return Action::Pause;
+                }
+            };
+
+            self.apply_invalidation_locally(&request);
+            self.enqueue_invalidation_for_fanout(&request);
+
+            self.send_http_response(
+                202,
+                vec![("content-type", "text/plain")],
+                Some(b"Accepted"),
+            );
+            Action::Pause
+        }
+
+        fn apply_invalidation_locally(&mut self, request: &crate::invalidation::InvalidationRequest) {
+            match request.op {
+                crate::invalidation::InvalidationOp::PurgeKey => {
+                    if let Some(key) = request.key.as_deref() {
+                        self.cache.borrow_mut().purge_key(key);
+                    }
+                }
+                crate::invalidation::InvalidationOp::PurgeAll => {
+                    self.cache.borrow_mut().purge_all();
+                }
+            }
+        }
+
+        fn enqueue_invalidation_for_fanout(
+            &self,
+            request: &crate::invalidation::InvalidationRequest,
+        ) {
+            let Some(control_queue_id) = self.control_queue_id else {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    "ext_authz: accepted invalidation but control queue is unavailable",
+                );
+                return;
+            };
+
+            let msg = crate::invalidation::QueueMessage::Invalidate(request.clone());
+            let Ok(bytes) = serde_json::to_vec(&msg) else {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    "ext_authz: failed to encode invalidation fan-out message",
+                );
+                return;
+            };
+
+            if let Err(status) = self.enqueue_shared_queue(control_queue_id, Some(&bytes)) {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    &format!("ext_authz: failed to enqueue invalidation fan-out: {:?}", status),
+                );
+            }
         }
     }
 
