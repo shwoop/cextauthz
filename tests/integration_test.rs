@@ -93,8 +93,12 @@ fn wait_for_envoy(timeout: Duration) -> Result<(), String> {
 }
 
 fn assert_port_free(port: u16) {
-    let _listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .unwrap_or_else(|e| panic!("Port {} is already in use: {}. Cannot run integration test.", port, e));
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+        panic!(
+            "Port {} is already in use: {}. Cannot run integration test.",
+            port, e
+        )
+    });
     // `_listener` is dropped when the function returns, right before Docker Compose starts,
     // minimizing the race window.
 }
@@ -143,6 +147,20 @@ fn test_ext_authz_filter() {
         200,
         "Expected 200 OK with auth header, got {}",
         allowed.status()
+    );
+
+    // Second identical request should hit the cache and still be allowed.
+    let allowed2 = client
+        .get("http://localhost:10000/")
+        .header("x-ext-authz", "allow")
+        .send()
+        .expect("Failed to send second request to Envoy");
+
+    assert_eq!(
+        allowed2.status(),
+        200,
+        "Expected 200 OK for cached request, got {}",
+        allowed2.status()
     );
 
     // Note: The authz service adds x-ext-authz-check-received and

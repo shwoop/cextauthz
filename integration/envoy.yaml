@@ -29,6 +29,9 @@ static_resources:
                       config:
                         name: cextauthz
                         root_id: cextauthz_root
+                        configuration:
+                          "@type": type.googleapis.com/google.protobuf.StringValue
+                          value: '{"timeout_ms":1000,"cache":{"enabled":true,"ttl_ms":5000,"max_size":100}}'
                         vm_config:
                           vm_id: cextauthz_vm
                           runtime: envoy.wasm.runtime.v8
