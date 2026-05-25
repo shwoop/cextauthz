@@ -64,7 +64,11 @@ pub fn validate_invalidation(
     if request.issued_at_ms > now_ms.saturating_add(MAX_INVALIDATION_SKEW_MS) {
         return Err(InvalidationParseError::IssuedAtInFuture);
     }
-    if now_ms > request.issued_at_ms.saturating_add(MAX_INVALIDATION_SKEW_MS) {
+    if now_ms
+        > request
+            .issued_at_ms
+            .saturating_add(MAX_INVALIDATION_SKEW_MS)
+    {
         return Err(InvalidationParseError::IssuedAtTooOld);
     }
     match request.op {
@@ -82,9 +86,7 @@ pub fn validate_invalidation(
 }
 
 pub fn is_valid_cache_key(key: &str) -> bool {
-    key.len() == 22
-        && key.starts_with("cache:")
-        && key[6..].bytes().all(|b| b.is_ascii_hexdigit())
+    key.len() == 22 && key.starts_with("cache:") && key[6..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Default)]

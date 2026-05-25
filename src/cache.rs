@@ -150,7 +150,8 @@ impl VmCache {
 }
 
 pub fn estimate_entry_bytes(key: &str) -> usize {
-    key.len().saturating_add(std::mem::size_of::<CacheEntry>())
+    key.len()
+        .saturating_add(std::mem::size_of::<CacheEntry>())
         .saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
 }
 
@@ -299,7 +300,15 @@ mod tests {
     #[test]
     fn vm_cache_returns_fresh_entry() {
         let mut cache = VmCache::new();
-        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
+        cache.insert(
+            "cache:0000000000000001".to_string(),
+            true,
+            0,
+            1000,
+            5000,
+            0,
+            4096,
+        );
 
         let entry = cache.get_fresh("cache:0000000000000001", 2000).unwrap();
         assert!(entry.allowed);
@@ -308,7 +317,15 @@ mod tests {
     #[test]
     fn vm_cache_expires_entry_on_read() {
         let mut cache = VmCache::new();
-        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 100, 0, 4096);
+        cache.insert(
+            "cache:0000000000000001".to_string(),
+            true,
+            0,
+            1000,
+            100,
+            0,
+            4096,
+        );
 
         assert!(cache.get_fresh("cache:0000000000000001", 1200).is_none());
         assert_eq!(cache.len(), 0);
@@ -318,8 +335,24 @@ mod tests {
     #[test]
     fn purge_key_removes_only_matching_entry() {
         let mut cache = VmCache::new();
-        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
-        cache.insert("cache:0000000000000002".to_string(), false, 403, 1001, 5000, 0, 4096);
+        cache.insert(
+            "cache:0000000000000001".to_string(),
+            true,
+            0,
+            1000,
+            5000,
+            0,
+            4096,
+        );
+        cache.insert(
+            "cache:0000000000000002".to_string(),
+            false,
+            403,
+            1001,
+            5000,
+            0,
+            4096,
+        );
 
         assert!(cache.purge_key("cache:0000000000000001"));
         assert!(cache.get_fresh("cache:0000000000000001", 2000).is_none());
@@ -329,8 +362,24 @@ mod tests {
     #[test]
     fn purge_all_clears_entries_and_byte_count() {
         let mut cache = VmCache::new();
-        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
-        cache.insert("cache:0000000000000002".to_string(), false, 403, 1001, 5000, 0, 4096);
+        cache.insert(
+            "cache:0000000000000001".to_string(),
+            true,
+            0,
+            1000,
+            5000,
+            0,
+            4096,
+        );
+        cache.insert(
+            "cache:0000000000000002".to_string(),
+            false,
+            403,
+            1001,
+            5000,
+            0,
+            4096,
+        );
 
         cache.purge_all();
 
@@ -342,8 +391,24 @@ mod tests {
     fn vm_cache_evicts_oldest_until_under_budget() {
         let mut cache = VmCache::new();
         let one_entry_budget = estimate_entry_bytes("cache:0000000000000001");
-        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, one_entry_budget);
-        cache.insert("cache:0000000000000002".to_string(), true, 0, 1001, 5000, 0, one_entry_budget);
+        cache.insert(
+            "cache:0000000000000001".to_string(),
+            true,
+            0,
+            1000,
+            5000,
+            0,
+            one_entry_budget,
+        );
+        cache.insert(
+            "cache:0000000000000002".to_string(),
+            true,
+            0,
+            1001,
+            5000,
+            0,
+            one_entry_budget,
+        );
 
         assert_eq!(cache.len(), 1);
         assert!(cache.get_fresh("cache:0000000000000001", 2000).is_none());

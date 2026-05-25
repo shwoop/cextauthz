@@ -123,7 +123,8 @@ mod wasm {
         fn on_queue_ready(&mut self, queue_id: u32) {
             if Some(queue_id) == self.control_queue_id && self.role == PluginRole::Singleton {
                 self.drain_control_queue(queue_id);
-            } else if Some(queue_id) == self.worker_queue_id && self.role == PluginRole::HttpFilter {
+            } else if Some(queue_id) == self.worker_queue_id && self.role == PluginRole::HttpFilter
+            {
                 self.drain_worker_queue(queue_id);
             }
         }
@@ -225,7 +226,10 @@ mod wasm {
             self.control_queue_id = Some(queue_id);
             let _ = proxy_wasm::hostcalls::log(
                 LogLevel::Info,
-                &format!("ext_authz: singleton registered control queue id {}", queue_id),
+                &format!(
+                    "ext_authz: singleton registered control queue id {}",
+                    queue_id
+                ),
             );
         }
 
@@ -245,7 +249,10 @@ mod wasm {
                 self.worker_queue_id = Some(queue_id);
                 let _ = proxy_wasm::hostcalls::log(
                     LogLevel::Info,
-                    &format!("ext_authz: worker registered invalidation queue id {}", queue_id),
+                    &format!(
+                        "ext_authz: worker registered invalidation queue id {}",
+                        queue_id
+                    ),
                 );
             }
 
@@ -293,13 +300,20 @@ mod wasm {
         }
 
         fn handle_control_queue_message(&mut self, bytes: &[u8]) {
-            let Ok(message) = serde_json::from_slice::<crate::invalidation::QueueMessage>(bytes) else {
-                let _ = proxy_wasm::hostcalls::log(LogLevel::Warn, "ext_authz: malformed control queue message");
+            let Ok(message) = serde_json::from_slice::<crate::invalidation::QueueMessage>(bytes)
+            else {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    "ext_authz: malformed control queue message",
+                );
                 return;
             };
             match message {
                 crate::invalidation::QueueMessage::RegisterWorker { queue_name } => {
-                    if self.registered_worker_queue_names.insert(queue_name.clone()) {
+                    if self
+                        .registered_worker_queue_names
+                        .insert(queue_name.clone())
+                    {
                         let _ = proxy_wasm::hostcalls::log(
                             LogLevel::Info,
                             &format!("ext_authz: registered worker queue {}", queue_name),
@@ -313,8 +327,13 @@ mod wasm {
         }
 
         fn broadcast_invalidation(&mut self, request: &crate::invalidation::InvalidationRequest) {
-            let Ok(bytes) = serde_json::to_vec(&crate::invalidation::QueueMessage::Invalidate(request.clone())) else {
-                let _ = proxy_wasm::hostcalls::log(LogLevel::Error, "ext_authz: failed to encode invalidation broadcast");
+            let Ok(bytes) = serde_json::to_vec(&crate::invalidation::QueueMessage::Invalidate(
+                request.clone(),
+            )) else {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Error,
+                    "ext_authz: failed to encode invalidation broadcast",
+                );
                 return;
             };
 
@@ -333,7 +352,10 @@ mod wasm {
                     self.registered_worker_queue_names.remove(&queue_name);
                     let _ = proxy_wasm::hostcalls::log(
                         LogLevel::Warn,
-                        &format!("ext_authz: failed to fan out to {}: {:?}", queue_name, status),
+                        &format!(
+                            "ext_authz: failed to fan out to {}: {:?}",
+                            queue_name, status
+                        ),
                     );
                 }
             }
@@ -359,7 +381,10 @@ mod wasm {
             let Ok(crate::invalidation::QueueMessage::Invalidate(request)) =
                 serde_json::from_slice::<crate::invalidation::QueueMessage>(bytes)
             else {
-                let _ = proxy_wasm::hostcalls::log(LogLevel::Warn, "ext_authz: malformed worker queue message");
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    "ext_authz: malformed worker queue message",
+                );
                 return;
             };
             self.apply_invalidation(&request);
@@ -503,8 +528,8 @@ mod wasm {
                 }
             }
 
-            self.is_invalidation_request = self.method == "POST"
-                && self.path == crate::invalidation::INVALIDATION_PATH;
+            self.is_invalidation_request =
+                self.method == "POST" && self.path == crate::invalidation::INVALIDATION_PATH;
 
             if self.is_invalidation_request {
                 if end_of_stream {
@@ -597,15 +622,14 @@ mod wasm {
             self.apply_invalidation_locally(&request);
             self.enqueue_invalidation_for_fanout(&request);
 
-            self.send_http_response(
-                202,
-                vec![("content-type", "text/plain")],
-                Some(b"Accepted"),
-            );
+            self.send_http_response(202, vec![("content-type", "text/plain")], Some(b"Accepted"));
             Action::Pause
         }
 
-        fn apply_invalidation_locally(&mut self, request: &crate::invalidation::InvalidationRequest) {
+        fn apply_invalidation_locally(
+            &mut self,
+            request: &crate::invalidation::InvalidationRequest,
+        ) {
             match request.op {
                 crate::invalidation::InvalidationOp::PurgeKey => {
                     if let Some(key) = request.key.as_deref() {
@@ -642,7 +666,10 @@ mod wasm {
             if let Err(status) = self.enqueue_shared_queue(control_queue_id, Some(&bytes)) {
                 let _ = proxy_wasm::hostcalls::log(
                     LogLevel::Warn,
-                    &format!("ext_authz: failed to enqueue invalidation fan-out: {:?}", status),
+                    &format!(
+                        "ext_authz: failed to enqueue invalidation fan-out: {:?}",
+                        status
+                    ),
                 );
             }
         }
@@ -697,10 +724,14 @@ mod wasm {
                 let now_ms = self.now_ms();
                 if let Some(entry) = self.cache.borrow_mut().get_fresh(key, now_ms) {
                     if entry.allowed {
-                        let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit (allowed)");
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Info,
+                            "ext_authz: cache hit (allowed)",
+                        );
                         return Action::Continue;
                     }
-                    let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit (denied)");
+                    let _ =
+                        proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit (denied)");
                     self.send_http_response(
                         entry.denied_status,
                         vec![("content-type", "text/plain")],
