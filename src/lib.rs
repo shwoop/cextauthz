@@ -120,6 +120,13 @@ mod wasm {
     impl Context for AuthzRoot {}
 
     impl RootContext for AuthzRoot {
+        fn on_queue_ready(&mut self, queue_id: u32) {
+            if Some(queue_id) == self.control_queue_id && self.role == PluginRole::Singleton {
+                self.drain_control_queue(queue_id);
+            } else if Some(queue_id) == self.worker_queue_id && self.role == PluginRole::HttpFilter {
+                self.drain_worker_queue(queue_id);
+            }
+        }
         fn on_configure(&mut self, plugin_configuration_size: usize) -> bool {
             if plugin_configuration_size == 0 {
                 return true;
@@ -169,6 +176,10 @@ mod wasm {
                     );
                 }
             }
+            match self.role {
+                PluginRole::HttpFilter => self.configure_worker_queue(),
+                PluginRole::Singleton => self.configure_singleton_queue(),
+            }
             true
         }
 
@@ -202,6 +213,169 @@ mod wasm {
                 control_queue_id: self.control_queue_id,
                 is_invalidation_request: false,
             }))
+        }
+    }
+
+    impl AuthzRoot {
+        fn configure_singleton_queue(&mut self) {
+            if self.control_queue_id.is_some() {
+                return;
+            }
+            let queue_id = self.register_shared_queue(crate::invalidation::CONTROL_QUEUE_NAME);
+            self.control_queue_id = Some(queue_id);
+            let _ = proxy_wasm::hostcalls::log(
+                LogLevel::Info,
+                &format!("ext_authz: singleton registered control queue id {}", queue_id),
+            );
+        }
+
+        fn configure_worker_queue(&mut self) {
+            if self.worker_queue_id.is_none() {
+                let queue_name = format!(
+                    "{}{}-{}",
+                    crate::invalidation::WORKER_QUEUE_PREFIX,
+                    self.get_current_time()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos(),
+                    self.cache.borrow().len()
+                );
+                let queue_id = self.register_shared_queue(&queue_name);
+                self.worker_queue_name = Some(queue_name);
+                self.worker_queue_id = Some(queue_id);
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Info,
+                    &format!("ext_authz: worker registered invalidation queue id {}", queue_id),
+                );
+            }
+
+            if self.control_queue_id.is_none() {
+                self.control_queue_id =
+                    self.resolve_shared_queue(VM_ID, crate::invalidation::CONTROL_QUEUE_NAME);
+            }
+
+            if let (Some(control_queue_id), Some(worker_queue_name)) =
+                (self.control_queue_id, self.worker_queue_name.as_ref())
+            {
+                let msg = crate::invalidation::QueueMessage::RegisterWorker {
+                    queue_name: worker_queue_name.clone(),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&msg) {
+                    if let Err(status) = self.enqueue_shared_queue(control_queue_id, Some(&bytes)) {
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Warn,
+                            &format!("ext_authz: failed to register worker queue: {:?}", status),
+                        );
+                    }
+                }
+            } else {
+                let _ = proxy_wasm::hostcalls::log(
+                    LogLevel::Warn,
+                    "ext_authz: singleton control queue not resolvable during worker configure",
+                );
+            }
+        }
+
+        fn drain_control_queue(&mut self, queue_id: u32) {
+            loop {
+                match self.dequeue_shared_queue(queue_id) {
+                    Ok(Some(bytes)) => self.handle_control_queue_message(&bytes),
+                    Ok(None) => break,
+                    Err(status) => {
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Warn,
+                            &format!("ext_authz: failed to dequeue control queue: {:?}", status),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        fn handle_control_queue_message(&mut self, bytes: &[u8]) {
+            let Ok(message) = serde_json::from_slice::<crate::invalidation::QueueMessage>(bytes) else {
+                let _ = proxy_wasm::hostcalls::log(LogLevel::Warn, "ext_authz: malformed control queue message");
+                return;
+            };
+            match message {
+                crate::invalidation::QueueMessage::RegisterWorker { queue_name } => {
+                    if self.registered_worker_queue_names.insert(queue_name.clone()) {
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Info,
+                            &format!("ext_authz: registered worker queue {}", queue_name),
+                        );
+                    }
+                }
+                crate::invalidation::QueueMessage::Invalidate(request) => {
+                    self.broadcast_invalidation(&request);
+                }
+            }
+        }
+
+        fn broadcast_invalidation(&mut self, request: &crate::invalidation::InvalidationRequest) {
+            let Ok(bytes) = serde_json::to_vec(&crate::invalidation::QueueMessage::Invalidate(request.clone())) else {
+                let _ = proxy_wasm::hostcalls::log(LogLevel::Error, "ext_authz: failed to encode invalidation broadcast");
+                return;
+            };
+
+            let queue_names: Vec<String> = self
+                .registered_worker_queue_names
+                .queue_names()
+                .map(str::to_string)
+                .collect();
+
+            for queue_name in queue_names {
+                let Some(queue_id) = self.resolve_shared_queue(VM_ID, &queue_name) else {
+                    self.registered_worker_queue_names.remove(&queue_name);
+                    continue;
+                };
+                if let Err(status) = self.enqueue_shared_queue(queue_id, Some(&bytes)) {
+                    self.registered_worker_queue_names.remove(&queue_name);
+                    let _ = proxy_wasm::hostcalls::log(
+                        LogLevel::Warn,
+                        &format!("ext_authz: failed to fan out to {}: {:?}", queue_name, status),
+                    );
+                }
+            }
+        }
+
+        fn drain_worker_queue(&mut self, queue_id: u32) {
+            loop {
+                match self.dequeue_shared_queue(queue_id) {
+                    Ok(Some(bytes)) => self.handle_worker_queue_message(&bytes),
+                    Ok(None) => break,
+                    Err(status) => {
+                        let _ = proxy_wasm::hostcalls::log(
+                            LogLevel::Warn,
+                            &format!("ext_authz: failed to dequeue worker queue: {:?}", status),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        fn handle_worker_queue_message(&mut self, bytes: &[u8]) {
+            let Ok(crate::invalidation::QueueMessage::Invalidate(request)) =
+                serde_json::from_slice::<crate::invalidation::QueueMessage>(bytes)
+            else {
+                let _ = proxy_wasm::hostcalls::log(LogLevel::Warn, "ext_authz: malformed worker queue message");
+                return;
+            };
+            self.apply_invalidation(&request);
+        }
+
+        fn apply_invalidation(&mut self, request: &crate::invalidation::InvalidationRequest) {
+            match request.op {
+                crate::invalidation::InvalidationOp::PurgeKey => {
+                    if let Some(key) = request.key.as_deref() {
+                        self.cache.borrow_mut().purge_key(key);
+                    }
+                }
+                crate::invalidation::InvalidationOp::PurgeAll => {
+                    self.cache.borrow_mut().purge_all();
+                }
+            }
         }
     }
 
