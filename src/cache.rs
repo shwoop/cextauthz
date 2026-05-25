@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+pub const CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
+
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     pub enabled: bool,
     pub ttl: std::time::Duration,
-    pub max_size: usize,
+    pub size_bytes: usize,
 }
 
 impl Default for CacheConfig {
@@ -15,44 +17,142 @@ impl Default for CacheConfig {
         Self {
             enabled: false,
             ttl: std::time::Duration::from_secs(60),
-            max_size: 1000,
+            size_bytes: 1024 * 1024,
         }
     }
 }
 
-/// What we actually store per cached request.
 #[derive(Clone, PartialEq, Message)]
 pub struct CacheEntry {
-    /// Unix timestamp in milliseconds when this entry expires.
     #[prost(uint64, tag = "1")]
     pub expires_at_ms: u64,
-
-    /// true = allowed, false = denied.
     #[prost(bool, tag = "2")]
     pub allowed: bool,
-
-    /// HTTP status code to return when allowed == false.
-    /// Only meaningful when denied.
     #[prost(uint32, tag = "3")]
     pub denied_status: u32,
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "5")]
+    pub inserted_at_ms: u64,
+    #[prost(uint64, tag = "6")]
+    pub estimated_bytes: u64,
 }
 
-/// A single shard of the cache.
-#[derive(Clone, Message)]
-pub struct CacheShard {
-    #[prost(map = "string, message", tag = "1")]
-    pub entries: HashMap<String, CacheEntry>,
+#[derive(Debug, Default)]
+pub struct VmCache {
+    entries: HashMap<String, CacheEntry>,
+    estimated_bytes: usize,
 }
 
-impl CacheShard {
+impl VmCache {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    pub fn get_fresh(&mut self, key: &str, now_ms: u64) -> Option<CacheEntry> {
+        let expired = self
+            .entries
+            .get(key)
+            .map(|entry| entry.expires_at_ms <= now_ms)
+            .unwrap_or(false);
+        if expired {
+            self.remove_key(key);
+            return None;
         }
+        self.entries.get(key).cloned()
+    }
+
+    pub fn insert(
+        &mut self,
+        key: String,
+        allowed: bool,
+        denied_status: u32,
+        now_ms: u64,
+        ttl_ms: u64,
+        epoch: u64,
+        budget_bytes: usize,
+    ) {
+        self.evict_expired(now_ms);
+        self.remove_key(&key);
+
+        let estimated_bytes = estimate_entry_bytes(&key);
+        let entry = CacheEntry {
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+            allowed,
+            denied_status,
+            epoch,
+            inserted_at_ms: now_ms,
+            estimated_bytes: estimated_bytes as u64,
+        };
+        self.estimated_bytes = self.estimated_bytes.saturating_add(estimated_bytes);
+        self.entries.insert(key, entry);
+        self.enforce_budget(budget_bytes);
+    }
+
+    pub fn purge_key(&mut self, key: &str) -> bool {
+        self.remove_key(key).is_some()
+    }
+
+    pub fn purge_all(&mut self) {
+        self.entries.clear();
+        self.estimated_bytes = 0;
+    }
+
+    pub fn evict_expired(&mut self, now_ms: u64) {
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                if entry.expires_at_ms <= now_ms {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in expired {
+            self.remove_key(&key);
+        }
+    }
+
+    fn enforce_budget(&mut self, budget_bytes: usize) {
+        while self.estimated_bytes > budget_bytes && !self.entries.is_empty() {
+            let oldest_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_key, entry)| entry.inserted_at_ms)
+                .map(|(key, _entry)| key.clone());
+            if let Some(key) = oldest_key {
+                self.remove_key(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove_key(&mut self, key: &str) -> Option<CacheEntry> {
+        let removed = self.entries.remove(key);
+        if let Some(entry) = &removed {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(entry.estimated_bytes as usize);
+        }
+        removed
     }
 }
 
-pub const NUM_SHARDS: usize = 16;
+pub fn estimate_entry_bytes(key: &str) -> usize {
+    key.len().saturating_add(std::mem::size_of::<CacheEntry>())
+        .saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
+}
 
 /// Compute a stable cache key from a CheckRequest.
 /// The key excludes the request_id (unique per request) so identical
@@ -111,19 +211,6 @@ pub fn compute_cache_key(req: &crate::pb::CheckRequest) -> String {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     format!("cache:{:016x}", hasher.finish())
-}
-
-pub fn shard_id_from_key(key: &str) -> usize {
-    let hash_part = &key[6..]; // skip "cache:"
-    u64::from_str_radix(hash_part, 16).unwrap_or(0) as usize % NUM_SHARDS
-}
-
-pub fn shard_shared_key(shard_id: usize) -> String {
-    format!("cache_shard:{}", shard_id)
-}
-
-pub fn shard_quota(max_size: usize) -> usize {
-    max_size.div_ceil(NUM_SHARDS)
 }
 
 #[cfg(test)]
@@ -210,52 +297,56 @@ mod tests {
     }
 
     #[test]
-    fn cache_shard_roundtrip() {
-        let mut shard = CacheShard::new();
-        shard.entries.insert(
-            "k1".to_string(),
-            CacheEntry {
-                expires_at_ms: 1234,
-                allowed: true,
-                denied_status: 0,
-            },
-        );
-        shard.entries.insert(
-            "k2".to_string(),
-            CacheEntry {
-                expires_at_ms: 5678,
-                allowed: false,
-                denied_status: 403,
-            },
-        );
+    fn vm_cache_returns_fresh_entry() {
+        let mut cache = VmCache::new();
+        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
 
-        let mut buf = Vec::new();
-        shard.encode(&mut buf).unwrap();
-        let decoded = CacheShard::decode(&buf[..]).unwrap();
-        assert_eq!(decoded.entries.len(), 2);
-        assert!(decoded.entries["k1"].allowed);
-        assert!(!decoded.entries["k2"].allowed);
-        assert_eq!(decoded.entries["k2"].denied_status, 403);
+        let entry = cache.get_fresh("cache:0000000000000001", 2000).unwrap();
+        assert!(entry.allowed);
     }
 
     #[test]
-    fn shard_id_distribution() {
-        let mut counts = vec![0usize; NUM_SHARDS];
-        for i in 0..1000 {
-            let key = format!("cache:{:016x}", i);
-            counts[shard_id_from_key(&key)] += 1;
-        }
-        // All shards should have received at least one key.
-        for (i, &c) in counts.iter().enumerate() {
-            assert!(c > 0, "shard {} got zero keys", i);
-        }
+    fn vm_cache_expires_entry_on_read() {
+        let mut cache = VmCache::new();
+        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 100, 0, 4096);
+
+        assert!(cache.get_fresh("cache:0000000000000001", 1200).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.estimated_bytes(), 0);
     }
 
     #[test]
-    fn shard_quota_rounding() {
-        assert_eq!(shard_quota(1000), 63); // 1000 / 16 = 62.5 -> 63
-        assert_eq!(shard_quota(16), 1);
-        assert_eq!(shard_quota(15), 1);
-        assert_eq!(shard_quota(1), 1);
+    fn purge_key_removes_only_matching_entry() {
+        let mut cache = VmCache::new();
+        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
+        cache.insert("cache:0000000000000002".to_string(), false, 403, 1001, 5000, 0, 4096);
+
+        assert!(cache.purge_key("cache:0000000000000001"));
+        assert!(cache.get_fresh("cache:0000000000000001", 2000).is_none());
+        assert!(cache.get_fresh("cache:0000000000000002", 2000).is_some());
+    }
+
+    #[test]
+    fn purge_all_clears_entries_and_byte_count() {
+        let mut cache = VmCache::new();
+        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, 4096);
+        cache.insert("cache:0000000000000002".to_string(), false, 403, 1001, 5000, 0, 4096);
+
+        cache.purge_all();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.estimated_bytes(), 0);
+    }
+
+    #[test]
+    fn vm_cache_evicts_oldest_until_under_budget() {
+        let mut cache = VmCache::new();
+        let one_entry_budget = estimate_entry_bytes("cache:0000000000000001");
+        cache.insert("cache:0000000000000001".to_string(), true, 0, 1000, 5000, 0, one_entry_budget);
+        cache.insert("cache:0000000000000002".to_string(), true, 0, 1001, 5000, 0, one_entry_budget);
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get_fresh("cache:0000000000000001", 2000).is_none());
+        assert!(cache.get_fresh("cache:0000000000000002", 2000).is_some());
     }
 }
