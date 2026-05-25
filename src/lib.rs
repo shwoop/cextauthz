@@ -360,6 +360,13 @@ mod wasm {
     }
 
     impl AuthzHttp {
+        fn now_ms(&self) -> u64 {
+            self.get_current_time()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+
         fn dispatch_check_request(&mut self) -> Action {
             self.dispatched = true;
 
@@ -398,39 +405,19 @@ mod wasm {
 
             // Check cache before dispatching gRPC call.
             if let Some(ref key) = cache_key {
-                let shard_id = crate::cache::shard_id_from_key(key);
-                let shard_key = crate::cache::shard_shared_key(shard_id);
-                let (data, _cas) = self.get_shared_data(&shard_key);
-                if let Some(bytes) = data {
-                    if let Ok(shard) = crate::cache::CacheShard::decode(&bytes[..]) {
-                        if let Some(entry) = shard.entries.get(key) {
-                            let now_ms = self
-                                .get_current_time()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            if entry.expires_at_ms > now_ms {
-                                if entry.allowed {
-                                    let _ = proxy_wasm::hostcalls::log(
-                                        LogLevel::Info,
-                                        "ext_authz: cache hit (allowed)",
-                                    );
-                                    return Action::Continue;
-                                } else {
-                                    let _ = proxy_wasm::hostcalls::log(
-                                        LogLevel::Info,
-                                        "ext_authz: cache hit (denied)",
-                                    );
-                                    self.send_http_response(
-                                        entry.denied_status,
-                                        vec![("content-type", "text/plain")],
-                                        Some(b"Forbidden"),
-                                    );
-                                    return Action::Pause;
-                                }
-                            }
-                        }
+                let now_ms = self.now_ms();
+                if let Some(entry) = self.cache.borrow_mut().get_fresh(key, now_ms) {
+                    if entry.allowed {
+                        let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit (allowed)");
+                        return Action::Continue;
                     }
+                    let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit (denied)");
+                    self.send_http_response(
+                        entry.denied_status,
+                        vec![("content-type", "text/plain")],
+                        Some(b"Forbidden"),
+                    );
+                    return Action::Pause;
                 }
             }
 
@@ -522,84 +509,24 @@ mod wasm {
                     .unwrap_or(403)
             };
 
-            let shard_id = crate::cache::shard_id_from_key(key);
-            let shard_key = crate::cache::shard_shared_key(shard_id);
-            let quota = crate::cache::shard_quota(self.cache_config.max_size);
-
-            for attempt in 0..3 {
-                let (data, cas) = self.get_shared_data(&shard_key);
-                let mut shard = data
-                    .and_then(|b| crate::cache::CacheShard::decode(&b[..]).ok())
-                    .unwrap_or_else(crate::cache::CacheShard::new);
-
-                let now_ms = self
-                    .get_current_time()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-
-                // Evict expired entries.
-                shard.entries.retain(|_k, v| v.expires_at_ms > now_ms);
-
-                let expires_at_ms = now_ms.saturating_add(self.cache_config.ttl.as_millis() as u64);
-                shard.entries.insert(
-                    key.clone(),
-                    crate::cache::CacheEntry {
-                        expires_at_ms,
-                        allowed,
-                        denied_status,
-                    },
-                );
-
-                // Enforce per-shard quota by dropping arbitrary entries.
-                while shard.entries.len() > quota {
-                    if let Some(k) = shard.entries.keys().next().cloned() {
-                        shard.entries.remove(&k);
-                    } else {
-                        break;
-                    }
-                }
-
-                let mut buf = Vec::new();
-                if shard.encode(&mut buf).is_err() {
-                    let _ = proxy_wasm::hostcalls::log(
-                        LogLevel::Error,
-                        "ext_authz: failed to encode cache shard",
-                    );
-                    return;
-                }
-
-                match self.set_shared_data(&shard_key, Some(&buf), cas) {
-                    Ok(()) => {
-                        let _ = proxy_wasm::hostcalls::log(
-                            LogLevel::Info,
-                            &format!("ext_authz: cached response (attempt {})", attempt + 1),
-                        );
-                        return;
-                    }
-                    Err(Status::CasMismatch) => {
-                        let _ = proxy_wasm::hostcalls::log(
-                            LogLevel::Debug,
-                            &format!(
-                                "ext_authz: cache CAS mismatch, retrying ({}/3)",
-                                attempt + 1
-                            ),
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = proxy_wasm::hostcalls::log(
-                            LogLevel::Error,
-                            &format!("ext_authz: failed to write cache shard: {:?}", e),
-                        );
-                        return;
-                    }
-                }
-            }
-
+            let now_ms = self.now_ms();
+            let ttl_ms = self.cache_config.ttl.as_millis() as u64;
+            self.cache.borrow_mut().insert(
+                key.clone(),
+                allowed,
+                denied_status,
+                now_ms,
+                ttl_ms,
+                0,
+                self.cache_config.size_bytes,
+            );
             let _ = proxy_wasm::hostcalls::log(
-                LogLevel::Warn,
-                "ext_authz: cache write failed after 3 CAS retries",
+                LogLevel::Info,
+                &format!(
+                    "ext_authz: cached response locally, entries={}, estimated_bytes={}",
+                    self.cache.borrow().len(),
+                    self.cache.borrow().estimated_bytes()
+                ),
             );
         }
     }
