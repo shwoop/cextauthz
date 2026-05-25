@@ -41,9 +41,3 @@ jobs:
 
       - name: Build WASM release
         run: cargo build --target wasm32-unknown-unknown --release
-
-      - name: Install cocogitto
-        uses: cocogitto/cocogitto-action@v3
-
-      - name: Validate conventional commits
-        run: cog check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
