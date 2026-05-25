@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod invalidation;
 pub mod pb;
 
 #[cfg(target_arch = "wasm32")]
