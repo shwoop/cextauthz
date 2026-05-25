@@ -1,3 +1,21 @@
+bootstrap_extensions:
+  - name: envoy.bootstrap.wasm
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.wasm.v3.WasmService
+      singleton: true
+      config:
+        name: cextauthz_singleton
+        root_id: cextauthz_singleton
+        configuration:
+          "@type": type.googleapis.com/google.protobuf.StringValue
+          value: '{"role":"singleton"}'
+        vm_config:
+          vm_id: cextauthz_vm
+          runtime: envoy.wasm.runtime.v8
+          code:
+            local:
+              filename: /etc/envoy/cextauthz.wasm
+
 static_resources:
   listeners:
     - name: listener_0
@@ -31,7 +49,7 @@ static_resources:
                         root_id: cextauthz_root
                         configuration:
                           "@type": type.googleapis.com/google.protobuf.StringValue
-                          value: '{"timeout_ms":1000,"cache":{"enabled":true,"ttl_ms":5000,"max_size":100}}'
+                          value: '{"role":"http_filter","timeout_ms":1000,"cache":{"enabled":true,"ttl_ms":5000,"size_kb":64},"invalidation":{"secret":"integration-secret"}}'
                         vm_config:
                           vm_id: cextauthz_vm
                           runtime: envoy.wasm.runtime.v8
