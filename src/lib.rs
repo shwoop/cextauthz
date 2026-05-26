@@ -1,3 +1,5 @@
+pub mod cache;
+pub mod invalidation;
 pub mod pb;
 
 #[cfg(target_arch = "wasm32")]
@@ -14,11 +16,17 @@ mod wasm {
 
     pub struct AuthzRoot {
         timeout_ms: u64,
+        cache_config: crate::cache::CacheConfig,
+        invalidation_secret: String,
     }
 
     pub struct AuthzHttp {
         pub grpc_token: Option<u32>,
         pub timeout: std::time::Duration,
+        cache_config: crate::cache::CacheConfig,
+        cache_key: Option<String>,
+        invalidation_secret: String,
+        is_invalidation_request: bool,
         dispatched: bool,
         method: String,
         path: String,
@@ -28,12 +36,65 @@ mod wasm {
         request_id: String,
         headers: HashMap<String, String>,
         body_buf: Vec<u8>,
+        body_seen: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PluginConfig {
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default)]
+        cache: CacheConfigJson,
+        #[serde(default)]
+        invalidation: InvalidationConfigJson,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CacheConfigJson {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default = "default_cache_ttl_ms")]
+        ttl_ms: u64,
+        #[serde(default = "default_cache_max_entries")]
+        max_entries: usize,
+    }
+
+    impl Default for CacheConfigJson {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                ttl_ms: default_cache_ttl_ms(),
+                max_entries: default_cache_max_entries(),
+            }
+        }
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct InvalidationConfigJson {
+        #[serde(default)]
+        secret: String,
+    }
+
+    fn default_timeout_ms() -> u64 {
+        1000
+    }
+
+    fn default_cache_ttl_ms() -> u64 {
+        60_000
+    }
+
+    fn default_cache_max_entries() -> usize {
+        1000
     }
 
     proxy_wasm::main! {{
         proxy_wasm::set_log_level(LogLevel::Info);
         proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
-            Box::new(AuthzRoot { timeout_ms: 1000 })
+            Box::new(AuthzRoot {
+                timeout_ms: default_timeout_ms(),
+                cache_config: crate::cache::CacheConfig::default(),
+                invalidation_secret: String::new(),
+            })
         });
     }}
 
@@ -47,16 +108,25 @@ mod wasm {
             if let Some(config) = self.get_plugin_configuration()
                 && let Ok(text) = std::str::from_utf8(&config)
             {
-                if let Ok(ms) = text.trim().parse::<u64>() {
-                    self.timeout_ms = ms;
+                if let Ok(config) = serde_json::from_str::<PluginConfig>(text) {
+                    self.timeout_ms = config.timeout_ms;
+                    self.cache_config = crate::cache::CacheConfig {
+                        enabled: config.cache.enabled,
+                        ttl: Duration::from_millis(config.cache.ttl_ms),
+                        max_entries: config.cache.max_entries,
+                    };
+                    self.invalidation_secret = config.invalidation.secret;
                     let _ = proxy_wasm::hostcalls::log(
                         proxy_wasm::types::LogLevel::Info,
-                        &format!("ext_authz: timeout configured to {} ms", self.timeout_ms),
+                        &format!(
+                            "ext_authz: configured timeout={}ms cache_enabled={}",
+                            self.timeout_ms, self.cache_config.enabled
+                        ),
                     );
                 } else {
                     let _ = proxy_wasm::hostcalls::log(
                         proxy_wasm::types::LogLevel::Warn,
-                        "ext_authz: plugin config is not a valid u64 (milliseconds); using default 1000 ms",
+                        "ext_authz: plugin config is not valid JSON; using defaults",
                     );
                 }
             }
@@ -71,6 +141,10 @@ mod wasm {
             Some(Box::new(AuthzHttp {
                 grpc_token: None,
                 timeout: Duration::from_millis(self.timeout_ms),
+                cache_config: self.cache_config.clone(),
+                cache_key: None,
+                invalidation_secret: self.invalidation_secret.clone(),
+                is_invalidation_request: false,
                 dispatched: false,
                 method: String::new(),
                 path: String::new(),
@@ -80,6 +154,7 @@ mod wasm {
                 request_id: String::new(),
                 headers: HashMap::new(),
                 body_buf: Vec::new(),
+                body_seen: 0,
             }))
         }
     }
@@ -93,7 +168,10 @@ mod wasm {
 
             if status_code != 0 {
                 let msg = if status_code == 4 {
-                    format!("ext_authz: gRPC call deadline exceeded (status {})", status_code)
+                    format!(
+                        "ext_authz: gRPC call deadline exceeded (status {})",
+                        status_code
+                    )
                 } else {
                     format!("ext_authz: gRPC call failed with status {}", status_code)
                 };
@@ -110,9 +188,26 @@ mod wasm {
                 match crate::pb::CheckResponse::decode(&body[..]) {
                     Ok(resp) => {
                         let allowed = matches!(
-                            resp.http_response,
+                            resp.http_response.as_ref(),
                             Some(crate::pb::check_response::HttpResponse::OkResponse(_))
                         );
+                        let denied_status = resp
+                            .http_response
+                            .as_ref()
+                            .and_then(|r| {
+                                if let crate::pb::check_response::HttpResponse::DeniedResponse(d) =
+                                    r
+                                {
+                                    d.status.as_ref().map(|s| s.code as u32)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(403);
+
+                        if self.cache_config.enabled {
+                            self.store_cache_entry(allowed, denied_status);
+                        }
 
                         if allowed {
                             let _ = proxy_wasm::hostcalls::log(
@@ -125,22 +220,8 @@ mod wasm {
                                 proxy_wasm::types::LogLevel::Info,
                                 "ext_authz: request denied",
                             );
-                            let status = resp
-                                .http_response
-                                .as_ref()
-                                .and_then(|r| {
-                                    if let crate::pb::check_response::HttpResponse::DeniedResponse(
-                                        d,
-                                    ) = r
-                                    {
-                                        d.status.as_ref().map(|s| s.code as u32)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(403);
                             self.send_http_response(
-                                status,
+                                denied_status,
                                 vec![("content-type", "text/plain")],
                                 Some(b"Forbidden"),
                             );
@@ -170,7 +251,6 @@ mod wasm {
                 );
             }
         }
-
     }
 
     impl HttpContext for AuthzHttp {
@@ -204,6 +284,16 @@ mod wasm {
                 }
             }
 
+            self.is_invalidation_request =
+                self.method == "POST" && self.path == crate::invalidation::INVALIDATION_PATH;
+
+            if self.is_invalidation_request {
+                if end_of_stream {
+                    return self.handle_invalidation_request();
+                }
+                return Action::Continue;
+            }
+
             if end_of_stream {
                 self.dispatch_check_request()
             } else {
@@ -216,10 +306,19 @@ mod wasm {
                 return Action::Pause;
             }
 
-            if body_size > 0 {
-                if let Some(chunk) = self.get_http_request_body(0, body_size) {
+            if body_size > self.body_seen {
+                let new_bytes = body_size - self.body_seen;
+                if let Some(chunk) = self.get_http_request_body(self.body_seen, new_bytes) {
                     self.body_buf.extend_from_slice(&chunk);
                 }
+                self.body_seen = body_size;
+            }
+
+            if self.is_invalidation_request {
+                if end_of_stream {
+                    return self.handle_invalidation_request();
+                }
+                return Action::Pause;
             }
 
             if end_of_stream {
@@ -230,10 +329,7 @@ mod wasm {
         }
 
         fn on_log(&mut self) {
-            let _ = proxy_wasm::hostcalls::log(
-                LogLevel::Info,
-                "ext_authz: request completed",
-            );
+            let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: request completed");
         }
     }
 
@@ -264,6 +360,24 @@ mod wasm {
                     context_extensions: HashMap::new(),
                 }),
             };
+
+            if self.cache_config.enabled {
+                let cache_key = crate::cache::compute_cache_key(&check_req);
+                self.cache_key = Some(cache_key.clone());
+
+                if let Some(entry) = self.get_cache_entry(&cache_key) {
+                    let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit");
+                    if entry.allowed {
+                        return Action::Continue;
+                    }
+                    self.send_http_response(
+                        entry.denied_status,
+                        vec![("content-type", "text/plain")],
+                        Some(b"Forbidden"),
+                    );
+                    return Action::Pause;
+                }
+            }
 
             let mut buf = Vec::new();
             if check_req.encode(&mut buf).is_err() {
@@ -302,6 +416,156 @@ mod wasm {
                         Some(b"Authz service unavailable"),
                     );
                     Action::Pause
+                }
+            }
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.get_current_time()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+
+        fn get_cache_entry(&self, cache_key: &str) -> Option<crate::cache::CacheEntry> {
+            let shard_id = crate::cache::shard_id_from_key(cache_key);
+            let shared_key = crate::cache::shard_shared_key(shard_id);
+            let now_ms = self.now_ms();
+
+            let (bytes, _cas) = self.get_shared_data(&shared_key);
+            let shard = crate::cache::decode_shard(bytes.as_deref());
+            let entry = shard.entries.get(cache_key)?;
+            if entry.expires_at_ms <= now_ms {
+                return None;
+            }
+            Some(entry.clone())
+        }
+
+        fn store_cache_entry(&self, allowed: bool, denied_status: u32) {
+            let Some(cache_key) = self.cache_key.as_deref() else {
+                return;
+            };
+            let shard_id = crate::cache::shard_id_from_key(cache_key);
+            let shared_key = crate::cache::shard_shared_key(shard_id);
+            let expires_at_ms = self
+                .now_ms()
+                .saturating_add(self.cache_config.ttl.as_millis() as u64);
+            let quota = crate::cache::shard_quota(self.cache_config.max_entries);
+
+            for _ in 0..3 {
+                let (bytes, cas) = self.get_shared_data(&shared_key);
+                let mut shard = crate::cache::decode_shard(bytes.as_deref());
+                crate::cache::evict_expired(&mut shard, self.now_ms());
+                shard.entries.insert(
+                    cache_key.to_string(),
+                    crate::cache::CacheEntry {
+                        expires_at_ms,
+                        allowed,
+                        denied_status,
+                    },
+                );
+                crate::cache::enforce_quota(&mut shard, quota);
+
+                let mut encoded = Vec::new();
+                if shard.encode(&mut encoded).is_err() {
+                    return;
+                }
+                if self
+                    .set_shared_data(&shared_key, Some(&encoded), cas)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        fn invalidation_authorized(&self) -> bool {
+            if self.invalidation_secret.is_empty() {
+                return false;
+            }
+            self.headers
+                .get(crate::invalidation::INVALIDATION_SECRET_HEADER)
+                .map(|value| value == &self.invalidation_secret)
+                .unwrap_or(false)
+        }
+
+        fn handle_invalidation_request(&mut self) -> Action {
+            self.dispatched = true;
+
+            if !self.invalidation_authorized() {
+                self.send_http_response(
+                    401,
+                    vec![("content-type", "text/plain")],
+                    Some(b"Unauthorized"),
+                );
+                return Action::Pause;
+            }
+
+            let request = match crate::invalidation::InvalidationRequest::parse(&self.body_buf) {
+                Ok(request) => request,
+                Err(err) => {
+                    self.send_http_response(
+                        400,
+                        vec![("content-type", "text/plain")],
+                        Some(err.as_bytes()),
+                    );
+                    return Action::Pause;
+                }
+            };
+
+            match request.op {
+                crate::invalidation::InvalidationOp::PurgeKey => {
+                    let key = request.key.unwrap();
+                    self.purge_cache_key(&key);
+                }
+                crate::invalidation::InvalidationOp::PurgeAll => {
+                    self.purge_all_cache_shards();
+                }
+            }
+
+            self.send_http_response(204, vec![], None);
+            Action::Pause
+        }
+
+        fn purge_cache_key(&self, cache_key: &str) {
+            let shard_id = crate::cache::shard_id_from_key(cache_key);
+            let shared_key = crate::cache::shard_shared_key(shard_id);
+
+            for _ in 0..3 {
+                let (bytes, cas) = self.get_shared_data(&shared_key);
+                let mut shard = crate::cache::decode_shard(bytes.as_deref());
+                shard.entries.remove(cache_key);
+
+                let mut encoded = Vec::new();
+                if shard.encode(&mut encoded).is_err() {
+                    return;
+                }
+                if self
+                    .set_shared_data(&shared_key, Some(&encoded), cas)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        fn purge_all_cache_shards(&self) {
+            let empty = crate::cache::CacheShard::default();
+            let mut encoded = Vec::new();
+            if empty.encode(&mut encoded).is_err() {
+                return;
+            }
+
+            for shard_id in 0..crate::cache::NUM_SHARDS {
+                let shared_key = crate::cache::shard_shared_key(shard_id);
+                for _ in 0..3 {
+                    let (_bytes, cas) = self.get_shared_data(&shared_key);
+                    if self
+                        .set_shared_data(&shared_key, Some(&encoded), cas)
+                        .is_ok()
+                    {
+                        break;
+                    }
                 }
             }
         }

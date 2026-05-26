@@ -93,10 +93,18 @@ fn wait_for_envoy(timeout: Duration) -> Result<(), String> {
 }
 
 fn assert_port_free(port: u16) {
-    let _listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .unwrap_or_else(|e| panic!("Port {} is already in use: {}. Cannot run integration test.", port, e));
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
+        panic!(
+            "Port {} is already in use: {}. Cannot run integration test.",
+            port, e
+        )
+    });
     // `_listener` is dropped when the function returns, right before Docker Compose starts,
     // minimizing the race window.
+}
+
+fn stop_authz_service(compose: &DockerCompose) {
+    compose.run(&["stop", "authz-service"]);
 }
 
 #[test]
@@ -143,6 +151,61 @@ fn test_ext_authz_filter() {
         200,
         "Expected 200 OK with auth header, got {}",
         allowed.status()
+    );
+
+    stop_authz_service(&_compose);
+
+    let cached_allowed = client
+        .get("http://localhost:10000/")
+        .header("x-ext-authz", "allow")
+        .send()
+        .expect("Failed to send cached request to Envoy");
+
+    assert_eq!(
+        cached_allowed.status(),
+        200,
+        "Expected cached 200 OK after authz service stopped, got {}",
+        cached_allowed.status()
+    );
+
+    let unauthorized_invalidation = client
+        .post("http://localhost:10000/_cextauthz/cache/invalidate")
+        .body(r#"{"version":1,"op":"purge_all"}"#)
+        .send()
+        .expect("Failed to send unauthorized invalidation request to Envoy");
+
+    assert_eq!(
+        unauthorized_invalidation.status(),
+        401,
+        "Expected 401 Unauthorized without invalidation secret, got {}",
+        unauthorized_invalidation.status()
+    );
+
+    let invalidated = client
+        .post("http://localhost:10000/_cextauthz/cache/invalidate")
+        .header("x-cextauthz-invalidation-secret", "integration-secret")
+        .body(r#"{"version":1,"op":"purge_all"}"#)
+        .send()
+        .expect("Failed to send invalidation request to Envoy");
+
+    assert_eq!(
+        invalidated.status(),
+        204,
+        "Expected 204 No Content for cache invalidation, got {}",
+        invalidated.status()
+    );
+
+    let after_invalidation = client
+        .get("http://localhost:10000/")
+        .header("x-ext-authz", "allow")
+        .send()
+        .expect("Failed to send post-invalidation request to Envoy");
+
+    assert_eq!(
+        after_invalidation.status(),
+        503,
+        "Expected 503 after cache invalidation with authz service stopped, got {}",
+        after_invalidation.status()
     );
 
     // Note: The authz service adds x-ext-authz-check-received and
