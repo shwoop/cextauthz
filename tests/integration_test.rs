@@ -255,6 +255,23 @@ fn invalidation_rejects_wrong_secret() {
 }
 
 #[test]
+fn oversized_request_body_is_rejected_before_authz_call() {
+    let _env = setup_compose();
+    let client = envoy_client();
+
+    let body = "x".repeat(2048);
+    let response = client
+        .post(format!("{ENVOY_URL}/"))
+        .header("x-ext-authz", "allow")
+        .body(body)
+        .send()
+        .expect("Failed to send oversized request to Envoy");
+
+    assert_eq!(response.status(), 413);
+    assert_eq!(response.text().unwrap(), "Payload Too Large");
+}
+
+#[test]
 fn denied_responses_are_cached() {
     let env = setup_compose();
     let client = envoy_client();

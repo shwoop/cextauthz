@@ -19,6 +19,8 @@ mod wasm {
 
     pub struct AuthzRoot {
         timeout_ms: u64,
+        grpc_cluster: String,
+        max_request_body_bytes: usize,
         cache_config: crate::cache::CacheConfig,
         invalidation_secret: String,
     }
@@ -26,6 +28,8 @@ mod wasm {
     pub struct AuthzHttp {
         pub grpc_token: Option<u32>,
         pub timeout: std::time::Duration,
+        grpc_cluster: String,
+        max_request_body_bytes: usize,
         cache_config: crate::cache::CacheConfig,
         cache_key: Option<String>,
         invalidation_secret: String,
@@ -48,6 +52,8 @@ mod wasm {
             let settings = crate::config::PluginSettings::default();
             Box::new(AuthzRoot {
                 timeout_ms: settings.timeout_ms,
+                grpc_cluster: settings.grpc_cluster,
+                max_request_body_bytes: settings.max_request_body_bytes,
                 cache_config: settings.cache,
                 invalidation_secret: settings.invalidation_secret,
             })
@@ -66,13 +72,15 @@ mod wasm {
             {
                 if let Ok(settings) = crate::config::PluginSettings::from_json(text) {
                     self.timeout_ms = settings.timeout_ms;
+                    self.grpc_cluster = settings.grpc_cluster;
+                    self.max_request_body_bytes = settings.max_request_body_bytes;
                     self.cache_config = settings.cache;
                     self.invalidation_secret = settings.invalidation_secret;
                     let _ = proxy_wasm::hostcalls::log(
                         proxy_wasm::types::LogLevel::Info,
                         &format!(
-                            "ext_authz: configured timeout={}ms cache_enabled={}",
-                            self.timeout_ms, self.cache_config.enabled
+                            "ext_authz: configured timeout={}ms cache_enabled={} max_request_body_bytes={}",
+                            self.timeout_ms, self.cache_config.enabled, self.max_request_body_bytes
                         ),
                     );
                 } else {
@@ -93,6 +101,8 @@ mod wasm {
             Some(Box::new(AuthzHttp {
                 grpc_token: None,
                 timeout: Duration::from_millis(self.timeout_ms),
+                grpc_cluster: self.grpc_cluster.clone(),
+                max_request_body_bytes: self.max_request_body_bytes,
                 cache_config: self.cache_config.clone(),
                 cache_key: None,
                 invalidation_secret: self.invalidation_secret.clone(),
@@ -203,6 +213,7 @@ mod wasm {
             }
 
             self.headers = HashMap::with_capacity(num_headers.saturating_sub(4));
+            let mut content_length = None;
 
             for (name, value) in self.get_http_request_headers() {
                 match name.as_str() {
@@ -221,10 +232,22 @@ mod wasm {
                         if name.eq_ignore_ascii_case("x-request-id") {
                             self.request_id = value;
                         } else if !name.starts_with(':') {
+                            if name.eq_ignore_ascii_case("content-length")
+                                && let Ok(length) = value.parse::<usize>()
+                            {
+                                content_length = Some(length);
+                            }
                             self.headers.insert(name.to_lowercase(), value);
                         }
                     }
                 }
+            }
+
+            if content_length
+                .map(|length| length > self.max_request_body_bytes)
+                .unwrap_or(false)
+            {
+                return self.reject_payload_too_large();
             }
 
             self.is_invalidation_request =
@@ -247,6 +270,10 @@ mod wasm {
         fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
             if self.dispatched {
                 return Action::Pause;
+            }
+
+            if body_size > self.max_request_body_bytes {
+                return self.reject_payload_too_large();
             }
 
             if body_size > self.body_seen {
@@ -277,6 +304,16 @@ mod wasm {
     }
 
     impl AuthzHttp {
+        fn reject_payload_too_large(&mut self) -> Action {
+            self.dispatched = true;
+            self.send_http_response(
+                413,
+                vec![("content-type", "text/plain")],
+                Some(b"Payload Too Large"),
+            );
+            Action::Pause
+        }
+
         fn dispatch_check_request(&mut self) -> Action {
             self.dispatched = true;
 
@@ -325,6 +362,7 @@ mod wasm {
                 return Action::Pause;
             }
 
+            let _configured_cluster = &self.grpc_cluster;
             match self.dispatch_grpc_call(
                 GRPC_CLUSTER,
                 GRPC_SERVICE,

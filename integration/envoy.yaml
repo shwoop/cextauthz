@@ -39,6 +39,9 @@ static_resources:
                                 "ttl_ms": 60000,
                                 "max_entries": 1000
                               },
+                              "request_body": {
+                                "max_bytes": 1024
+                              },
                               "invalidation": {
                                 "secret": "integration-secret"
                               }
