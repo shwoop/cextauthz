@@ -151,33 +151,50 @@ mod wasm {
                     Ok(resp) => {
                         let decision =
                             crate::decision::AuthorizationDecision::from_check_response(&resp);
-                        let allowed =
-                            matches!(decision, crate::decision::AuthorizationDecision::Allow);
-                        let denied_status = match decision {
-                            crate::decision::AuthorizationDecision::Allow => 0,
-                            crate::decision::AuthorizationDecision::Deny { status } => status,
-                        };
+                        match decision {
+                            crate::decision::AuthorizationDecision::Allow { request_headers } => {
+                                if self.cache_config.enabled {
+                                    self.store_cache_entry(true, 0);
+                                }
+                                let _ = proxy_wasm::hostcalls::log(
+                                    proxy_wasm::types::LogLevel::Info,
+                                    "ext_authz: request allowed",
+                                );
+                                self.apply_request_headers(&request_headers);
+                                self.resume_http_request();
+                            }
+                            crate::decision::AuthorizationDecision::Deny {
+                                status,
+                                body,
+                                headers,
+                            } => {
+                                if self.cache_config.enabled {
+                                    self.store_cache_entry(false, status);
+                                }
+                                let _ = proxy_wasm::hostcalls::log(
+                                    proxy_wasm::types::LogLevel::Info,
+                                    "ext_authz: request denied",
+                                );
 
-                        if self.cache_config.enabled {
-                            self.store_cache_entry(allowed, denied_status);
-                        }
+                                let mut response_headers: Vec<(&str, &str)> = Vec::new();
+                                if !headers
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                                {
+                                    response_headers.push(("content-type", "text/plain"));
+                                }
+                                response_headers.extend(
+                                    headers
+                                        .iter()
+                                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                                );
 
-                        if allowed {
-                            let _ = proxy_wasm::hostcalls::log(
-                                proxy_wasm::types::LogLevel::Info,
-                                "ext_authz: request allowed",
-                            );
-                            self.resume_http_request();
-                        } else {
-                            let _ = proxy_wasm::hostcalls::log(
-                                proxy_wasm::types::LogLevel::Info,
-                                "ext_authz: request denied",
-                            );
-                            self.send_http_response(
-                                denied_status,
-                                vec![("content-type", "text/plain")],
-                                Some(b"Forbidden"),
-                            );
+                                self.send_http_response(
+                                    status,
+                                    response_headers,
+                                    Some(body.as_bytes()),
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -449,6 +466,12 @@ mod wasm {
                 {
                     return;
                 }
+            }
+        }
+
+        fn apply_request_headers(&self, headers: &[(String, String)]) {
+            for (name, value) in headers {
+                self.set_http_request_header(name, Some(value));
             }
         }
 

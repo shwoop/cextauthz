@@ -91,15 +91,34 @@ pub mod check_response {
 pub struct DeniedHttpResponse {
     #[prost(message, optional, tag = "1")]
     pub status: Option<HttpStatus>,
+    #[prost(message, repeated, tag = "2")]
+    pub headers: Vec<HeaderValueOption>,
     #[prost(string, tag = "3")]
     pub body: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct OkHttpResponse {}
+pub struct OkHttpResponse {
+    #[prost(message, repeated, tag = "2")]
+    pub headers: Vec<HeaderValueOption>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct HttpStatus {
     #[prost(int32, tag = "1")]
     pub code: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HeaderValueOption {
+    #[prost(message, optional, tag = "1")]
+    pub header: Option<HeaderValue>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HeaderValue {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
