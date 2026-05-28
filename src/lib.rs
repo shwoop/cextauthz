@@ -13,7 +13,6 @@ mod wasm {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    const GRPC_CLUSTER: &str = "ext_authz";
     const GRPC_SERVICE: &str = "envoy.service.auth.v3.Authorization";
     const GRPC_METHOD: &str = "Check";
 
@@ -374,9 +373,8 @@ mod wasm {
                 return Action::Pause;
             }
 
-            let _configured_cluster = &self.grpc_cluster;
             match self.dispatch_grpc_call(
-                GRPC_CLUSTER,
+                self.grpc_cluster.as_str(),
                 GRPC_SERVICE,
                 GRPC_METHOD,
                 vec![],
