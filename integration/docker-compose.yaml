@@ -1,13 +1,9 @@
 services:
   upstream:
     image: nginx:alpine
-    ports:
-      - "8080:80"
 
   authz-service:
     image: registry.istio.io/testing/ext-authz:latest
-    ports:
-      - "9000:9000"
 
   envoy:
     image: envoyproxy/envoy:v1.30-latest

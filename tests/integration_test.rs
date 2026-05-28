@@ -117,8 +117,6 @@ fn test_ext_authz_filter() {
     );
 
     assert_port_free(10000);
-    assert_port_free(9000);
-    assert_port_free(8080);
 
     let _compose = DockerCompose::new("integration");
 
