@@ -13,12 +13,13 @@ mod wasm {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    const GRPC_CLUSTER: &str = "ext_authz";
     const GRPC_SERVICE: &str = "envoy.service.auth.v3.Authorization";
     const GRPC_METHOD: &str = "Check";
 
     pub struct AuthzRoot {
         timeout_ms: u64,
+        grpc_cluster: String,
+        max_request_body_bytes: usize,
         cache_config: crate::cache::CacheConfig,
         invalidation_secret: String,
     }
@@ -26,6 +27,8 @@ mod wasm {
     pub struct AuthzHttp {
         pub grpc_token: Option<u32>,
         pub timeout: std::time::Duration,
+        grpc_cluster: String,
+        max_request_body_bytes: usize,
         cache_config: crate::cache::CacheConfig,
         cache_key: Option<String>,
         invalidation_secret: String,
@@ -48,6 +51,8 @@ mod wasm {
             let settings = crate::config::PluginSettings::default();
             Box::new(AuthzRoot {
                 timeout_ms: settings.timeout_ms,
+                grpc_cluster: settings.grpc_cluster,
+                max_request_body_bytes: settings.max_request_body_bytes,
                 cache_config: settings.cache,
                 invalidation_secret: settings.invalidation_secret,
             })
@@ -64,23 +69,37 @@ mod wasm {
             if let Some(config) = self.get_plugin_configuration()
                 && let Ok(text) = std::str::from_utf8(&config)
             {
-                if let Ok(settings) = crate::config::PluginSettings::from_json(text) {
-                    self.timeout_ms = settings.timeout_ms;
-                    self.cache_config = settings.cache;
-                    self.invalidation_secret = settings.invalidation_secret;
-                    let _ = proxy_wasm::hostcalls::log(
-                        proxy_wasm::types::LogLevel::Info,
-                        &format!(
-                            "ext_authz: configured timeout={}ms cache_enabled={}",
-                            self.timeout_ms, self.cache_config.enabled
-                        ),
-                    );
-                } else {
-                    let _ = proxy_wasm::hostcalls::log(
-                        proxy_wasm::types::LogLevel::Warn,
-                        "ext_authz: plugin config is not valid JSON; using defaults",
-                    );
+                match crate::config::PluginSettings::from_json(text) {
+                    Ok(settings) => {
+                        self.timeout_ms = settings.timeout_ms;
+                        self.grpc_cluster = settings.grpc_cluster;
+                        self.max_request_body_bytes = settings.max_request_body_bytes;
+                        self.cache_config = settings.cache;
+                        self.invalidation_secret = settings.invalidation_secret;
+                        let _ = proxy_wasm::hostcalls::log(
+                            proxy_wasm::types::LogLevel::Info,
+                            &format!(
+                                "ext_authz: configured timeout={}ms cache_enabled={} max_request_body_bytes={}",
+                                self.timeout_ms,
+                                self.cache_config.enabled,
+                                self.max_request_body_bytes
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        let _ = proxy_wasm::hostcalls::log(
+                            proxy_wasm::types::LogLevel::Error,
+                            &format!("ext_authz: plugin config rejected: {err}"),
+                        );
+                        return false;
+                    }
                 }
+            } else {
+                let _ = proxy_wasm::hostcalls::log(
+                    proxy_wasm::types::LogLevel::Error,
+                    "ext_authz: plugin config is not valid UTF-8",
+                );
+                return false;
             }
             true
         }
@@ -93,6 +112,8 @@ mod wasm {
             Some(Box::new(AuthzHttp {
                 grpc_token: None,
                 timeout: Duration::from_millis(self.timeout_ms),
+                grpc_cluster: self.grpc_cluster.clone(),
+                max_request_body_bytes: self.max_request_body_bytes,
                 cache_config: self.cache_config.clone(),
                 cache_key: None,
                 invalidation_secret: self.invalidation_secret.clone(),
@@ -141,33 +162,45 @@ mod wasm {
                     Ok(resp) => {
                         let decision =
                             crate::decision::AuthorizationDecision::from_check_response(&resp);
-                        let allowed =
-                            matches!(decision, crate::decision::AuthorizationDecision::Allow);
-                        let denied_status = match decision {
-                            crate::decision::AuthorizationDecision::Allow => 0,
-                            crate::decision::AuthorizationDecision::Deny { status } => status,
-                        };
+                        match decision {
+                            crate::decision::AuthorizationDecision::Allow {
+                                request_header_mutations,
+                            } => {
+                                if self.cache_config.enabled {
+                                    self.store_cache_entry(
+                                        true,
+                                        0,
+                                        "",
+                                        &[],
+                                        &request_header_mutations,
+                                    );
+                                }
+                                let _ = proxy_wasm::hostcalls::log(
+                                    proxy_wasm::types::LogLevel::Info,
+                                    "ext_authz: request allowed",
+                                );
+                                self.apply_request_header_mutations(&request_header_mutations);
+                                self.resume_http_request();
+                            }
+                            crate::decision::AuthorizationDecision::Deny {
+                                status,
+                                body,
+                                headers,
+                            } => {
+                                if self.cache_config.enabled {
+                                    self.store_cache_entry(false, status, &body, &headers, &[]);
+                                }
+                                let _ = proxy_wasm::hostcalls::log(
+                                    proxy_wasm::types::LogLevel::Info,
+                                    "ext_authz: request denied",
+                                );
 
-                        if self.cache_config.enabled {
-                            self.store_cache_entry(allowed, denied_status);
-                        }
-
-                        if allowed {
-                            let _ = proxy_wasm::hostcalls::log(
-                                proxy_wasm::types::LogLevel::Info,
-                                "ext_authz: request allowed",
-                            );
-                            self.resume_http_request();
-                        } else {
-                            let _ = proxy_wasm::hostcalls::log(
-                                proxy_wasm::types::LogLevel::Info,
-                                "ext_authz: request denied",
-                            );
-                            self.send_http_response(
-                                denied_status,
-                                vec![("content-type", "text/plain")],
-                                Some(b"Forbidden"),
-                            );
+                                self.send_http_response(
+                                    status,
+                                    local_reply_headers(&headers),
+                                    Some(body.as_bytes()),
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -203,6 +236,7 @@ mod wasm {
             }
 
             self.headers = HashMap::with_capacity(num_headers.saturating_sub(4));
+            let mut content_length = None;
 
             for (name, value) in self.get_http_request_headers() {
                 match name.as_str() {
@@ -221,10 +255,22 @@ mod wasm {
                         if name.eq_ignore_ascii_case("x-request-id") {
                             self.request_id = value;
                         } else if !name.starts_with(':') {
+                            if name.eq_ignore_ascii_case("content-length")
+                                && let Ok(length) = value.parse::<usize>()
+                            {
+                                content_length = Some(length);
+                            }
                             self.headers.insert(name.to_lowercase(), value);
                         }
                     }
                 }
+            }
+
+            if content_length
+                .map(|length| length > self.max_request_body_bytes)
+                .unwrap_or(false)
+            {
+                return self.reject_payload_too_large();
             }
 
             self.is_invalidation_request =
@@ -247,6 +293,10 @@ mod wasm {
         fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
             if self.dispatched {
                 return Action::Pause;
+            }
+
+            if body_size > self.max_request_body_bytes {
+                return self.reject_payload_too_large();
             }
 
             if body_size > self.body_seen {
@@ -277,6 +327,16 @@ mod wasm {
     }
 
     impl AuthzHttp {
+        fn reject_payload_too_large(&mut self) -> Action {
+            self.dispatched = true;
+            self.send_http_response(
+                413,
+                vec![("content-type", "text/plain")],
+                Some(b"Payload Too Large"),
+            );
+            Action::Pause
+        }
+
         fn dispatch_check_request(&mut self) -> Action {
             self.dispatched = true;
 
@@ -293,18 +353,30 @@ mod wasm {
             .into_check_request();
 
             if self.cache_config.enabled {
-                let cache_key = crate::cache::compute_cache_key(&check_req);
+                let cache_key =
+                    crate::cache::compute_cache_key(&check_req, &self.cache_config.header_policy);
                 self.cache_key = Some(cache_key.clone());
 
                 if let Some(entry) = self.get_cache_entry(&cache_key) {
                     let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit");
                     if entry.allowed {
+                        let request_header_mutations =
+                            cached_request_header_mutations_to_request_header_mutations(
+                                &entry.request_header_mutations,
+                            );
+                        self.apply_request_header_mutations(&request_header_mutations);
                         return Action::Continue;
                     }
+                    let response_headers = cached_headers_to_pairs(&entry.response_headers);
+                    let body = if entry.denied_body.is_empty() {
+                        "Forbidden".to_string()
+                    } else {
+                        entry.denied_body
+                    };
                     self.send_http_response(
                         entry.denied_status,
-                        vec![("content-type", "text/plain")],
-                        Some(b"Forbidden"),
+                        local_reply_headers(&response_headers),
+                        Some(body.as_bytes()),
                     );
                     return Action::Pause;
                 }
@@ -325,7 +397,7 @@ mod wasm {
             }
 
             match self.dispatch_grpc_call(
-                GRPC_CLUSTER,
+                self.grpc_cluster.as_str(),
                 GRPC_SERVICE,
                 GRPC_METHOD,
                 vec![],
@@ -372,7 +444,14 @@ mod wasm {
             Some(entry.clone())
         }
 
-        fn store_cache_entry(&self, allowed: bool, denied_status: u32) {
+        fn store_cache_entry(
+            &self,
+            allowed: bool,
+            denied_status: u32,
+            denied_body: &str,
+            response_headers: &[(String, String)],
+            request_header_mutations: &[crate::decision::RequestHeaderMutation],
+        ) {
             let Some(cache_key) = self.cache_key.as_deref() else {
                 return;
             };
@@ -393,6 +472,18 @@ mod wasm {
                         expires_at_ms,
                         allowed,
                         denied_status,
+                        denied_body: denied_body.to_string(),
+                        response_headers: response_headers
+                            .iter()
+                            .map(|(name, value)| crate::cache::CachedHeader {
+                                name: name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                        request_header_mutations: request_header_mutations
+                            .iter()
+                            .map(crate::cache::CachedRequestHeaderMutation::from)
+                            .collect(),
                     },
                 );
                 crate::cache::enforce_quota(&mut shard, quota);
@@ -406,6 +497,43 @@ mod wasm {
                     .is_ok()
                 {
                     return;
+                }
+            }
+        }
+
+        fn apply_request_header_mutations(
+            &self,
+            mutations: &[crate::decision::RequestHeaderMutation],
+        ) {
+            for mutation in mutations {
+                match mutation {
+                    crate::decision::RequestHeaderMutation::AppendIfExistsOrAdd { name, value } => {
+                        self.add_http_request_header(name, value);
+                    }
+                    crate::decision::RequestHeaderMutation::AddIfAbsent { name, value } => {
+                        if self.get_http_request_header(name).is_none() {
+                            self.add_http_request_header(name, value);
+                        }
+                    }
+                    crate::decision::RequestHeaderMutation::OverwriteIfExistsOrAdd {
+                        name,
+                        value,
+                    } => {
+                        self.set_http_request_header(name, Some(value));
+                    }
+                    crate::decision::RequestHeaderMutation::OverwriteIfExists { name, value } => {
+                        if self.get_http_request_header(name).is_some() {
+                            self.set_http_request_header(name, Some(value));
+                        }
+                    }
+                    crate::decision::RequestHeaderMutation::Remove { name } => {
+                        if !name.is_empty()
+                            && !name.starts_with(':')
+                            && !name.eq_ignore_ascii_case("host")
+                        {
+                            self.remove_http_request_header(name);
+                        }
+                    }
                 }
             }
         }
@@ -500,5 +628,37 @@ mod wasm {
                 }
             }
         }
+    }
+
+    fn cached_headers_to_pairs(headers: &[crate::cache::CachedHeader]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect()
+    }
+
+    fn cached_request_header_mutations_to_request_header_mutations(
+        mutations: &[crate::cache::CachedRequestHeaderMutation],
+    ) -> Vec<crate::decision::RequestHeaderMutation> {
+        mutations
+            .iter()
+            .filter_map(|mutation| std::convert::TryFrom::try_from(mutation).ok())
+            .collect()
+    }
+
+    fn local_reply_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+        let mut response_headers = Vec::new();
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
+            response_headers.push(("content-type", "text/plain"));
+        }
+        response_headers.extend(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        response_headers
     }
 }

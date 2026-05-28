@@ -91,15 +91,63 @@ pub mod check_response {
 pub struct DeniedHttpResponse {
     #[prost(message, optional, tag = "1")]
     pub status: Option<HttpStatus>,
+    #[prost(message, repeated, tag = "2")]
+    pub headers: Vec<HeaderValueOption>,
     #[prost(string, tag = "3")]
     pub body: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct OkHttpResponse {}
+// TODO: model the remaining OkHttpResponse query-parameter mutation fields if Envoy starts
+// exercising them in this fixture.
+pub struct OkHttpResponse {
+    #[prost(message, repeated, tag = "2")]
+    pub headers: Vec<HeaderValueOption>,
+    #[prost(string, repeated, tag = "5")]
+    pub headers_to_remove: Vec<String>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct HttpStatus {
     #[prost(int32, tag = "1")]
     pub code: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HeaderValueOption {
+    #[prost(message, optional, tag = "1")]
+    pub header: Option<HeaderValue>,
+    #[prost(message, optional, tag = "2")]
+    pub append: Option<BoolValue>,
+    #[prost(enumeration = "header_value_option::HeaderAppendAction", tag = "3")]
+    pub append_action: i32,
+    #[prost(bool, tag = "4")]
+    pub keep_empty_value: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HeaderValue {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BoolValue {
+    #[prost(bool, tag = "1")]
+    pub value: bool,
+}
+
+pub mod header_value_option {
+    use prost::Enumeration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+    #[repr(i32)]
+    pub enum HeaderAppendAction {
+        AppendIfExistsOrAdd = 0,
+        AddIfAbsent = 1,
+        OverwriteIfExistsOrAdd = 2,
+        OverwriteIfExists = 3,
+    }
 }

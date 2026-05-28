@@ -1,12 +1,12 @@
 services:
   upstream:
-    image: nginx:alpine
+    image: nginx:1.27.5-alpine
 
   authz-service:
-    image: registry.istio.io/testing/ext-authz:latest
+    image: istio/ext-authz:1.30.0-debug
 
   envoy:
-    image: envoyproxy/envoy:v1.30-latest
+    image: envoyproxy/envoy:v1.30.11
     ports:
       - "10000:10000"
     volumes:

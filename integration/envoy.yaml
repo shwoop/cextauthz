@@ -34,10 +34,16 @@ static_resources:
                           value: |
                             {
                               "timeout_ms": 1000,
+                              "grpc": {
+                                "cluster": "ext_authz"
+                              },
                               "cache": {
                                 "enabled": true,
                                 "ttl_ms": 60000,
                                 "max_entries": 1000
+                              },
+                              "request_body": {
+                                "max_bytes": 1024
                               },
                               "invalidation": {
                                 "secret": "integration-secret"
