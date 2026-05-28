@@ -30,8 +30,8 @@ Malformed or empty authz responses return HTTP `500`.
 
 ## Configuration
 
-The filter reads JSON from the Envoy Wasm plugin configuration. All fields are
-optional.
+The filter reads JSON from the Envoy Wasm plugin configuration. `grpc.cluster`
+is required; the other fields are optional.
 
 ```json
 {
@@ -62,7 +62,7 @@ Defaults:
 | Field | Default | Description |
 | --- | --- | --- |
 | `timeout_ms` | `1000` | gRPC authorization call timeout in milliseconds |
-| `grpc.cluster` | `"ext_authz"` | Envoy cluster used for the ext_authz gRPC call |
+| `grpc.cluster` | required | Envoy cluster used for the ext_authz gRPC call |
 | `request_body.max_bytes` | `1048576` | maximum buffered request body bytes before returning `413` |
 | `cache.enabled` | `false` | enables shared-data decision caching |
 | `cache.ttl_ms` | `60000` | cache entry TTL in milliseconds |
@@ -268,11 +268,11 @@ Pin the release version and set `sha256` for production deployments. Without
 downloaded WASM bytes.
 
 This filter dispatches authorization checks to the Envoy cluster configured by
-`grpc.cluster`, which defaults to `ext_authz`. The local Docker fixture creates
-that cluster in `integration/envoy.yaml`, but Envoy Gateway will not create it
-automatically from the `EnvoyExtensionPolicy`. For Envoy Gateway deployments,
-add an `EnvoyPatchPolicy` or other Envoy configuration that creates the cluster
-named by `grpc.cluster` for your authorization service.
+`grpc.cluster`. The local Docker fixture creates that cluster in
+`integration/envoy.yaml`, but Envoy Gateway will not create it automatically
+from the `EnvoyExtensionPolicy`. For Envoy Gateway deployments, add an
+`EnvoyPatchPolicy` or other Envoy configuration that creates the cluster named
+by `grpc.cluster` for your authorization service.
 
 Envoy Gateway also supports packaging the WASM module as an OCI image and using
 `code.type: Image` instead of an HTTP URL.

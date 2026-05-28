@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-pub const DEFAULT_GRPC_CLUSTER: &str = "ext_authz";
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 pub const MAX_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -59,18 +58,10 @@ struct PluginConfigJson {
     invalidation: InvalidationConfigJson,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 struct GrpcConfigJson {
-    #[serde(default = "default_grpc_cluster_string")]
-    cluster: String,
-}
-
-impl Default for GrpcConfigJson {
-    fn default() -> Self {
-        Self {
-            cluster: default_grpc_cluster_string(),
-        }
-    }
+    #[serde(default)]
+    cluster: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -137,10 +128,6 @@ pub fn default_timeout_ms() -> u64 {
     1000
 }
 
-fn default_grpc_cluster_string() -> String {
-    DEFAULT_GRPC_CLUSTER.to_string()
-}
-
 fn default_max_request_body_bytes() -> usize {
     DEFAULT_MAX_REQUEST_BODY_BYTES
 }
@@ -161,7 +148,7 @@ impl Default for PluginSettings {
     fn default() -> Self {
         Self {
             timeout_ms: default_timeout_ms(),
-            grpc_cluster: DEFAULT_GRPC_CLUSTER.to_string(),
+            grpc_cluster: String::new(),
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             cache: crate::cache::CacheConfig::default(),
             invalidation_secret: String::new(),
@@ -173,7 +160,10 @@ impl PluginSettings {
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
         let config = serde_json::from_str::<PluginConfigJson>(text)?;
         validate_timeout_ms(config.timeout_ms)?;
-        let grpc_cluster = normalize_grpc_cluster(&config.grpc.cluster)?;
+        let grpc_cluster =
+            normalize_grpc_cluster(config.grpc.cluster.as_deref().ok_or_else(|| {
+                ConfigError::Invalid("grpc.cluster must not be empty".to_string())
+            })?)?;
         validate_body_limit(config.request_body.max_bytes)?;
         validate_cache(&config.cache)?;
 
@@ -278,10 +268,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_current_filter_behavior() {
-        let settings = PluginSettings::from_json("{}").unwrap();
+    fn parses_defaults_for_optional_settings() {
+        let settings = PluginSettings::from_json(r#"{"grpc":{"cluster":"ext_authz"}}"#).unwrap();
 
         assert_eq!(settings.timeout_ms, 1000);
+        assert_eq!(settings.grpc_cluster, "ext_authz");
         assert!(!settings.cache.enabled);
         assert_eq!(settings.cache.ttl, Duration::from_millis(60_000));
         assert_eq!(settings.cache.max_entries, 1000);
@@ -291,7 +282,7 @@ mod tests {
     #[test]
     fn parses_cache_and_invalidation_settings() {
         let settings = PluginSettings::from_json(
-            r#"{"timeout_ms":250,"cache":{"enabled":true,"ttl_ms":5000,"max_entries":32},"invalidation":{"secret":"secret"}}"#,
+            r#"{"timeout_ms":250,"grpc":{"cluster":"ext_authz"},"cache":{"enabled":true,"ttl_ms":5000,"max_entries":32},"invalidation":{"secret":"secret"}}"#,
         )
         .unwrap();
 
@@ -342,21 +333,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_preserve_current_behavior_with_safe_body_limit() {
-        let settings = PluginSettings::from_json("{}").unwrap();
-
-        assert_eq!(settings.timeout_ms, 1000);
-        assert_eq!(settings.grpc_cluster, "ext_authz");
-        assert_eq!(settings.max_request_body_bytes, 1_048_576);
-        assert_eq!(
-            settings.cache.header_policy,
-            crate::cache::CacheHeaderPolicy::AllExceptRequestId
-        );
+    fn rejects_missing_grpc_cluster() {
+        let err = PluginSettings::from_json("{}").unwrap_err();
+        assert_eq!(err.to_string(), "grpc.cluster must not be empty");
     }
 
     #[test]
     fn rejects_zero_timeout() {
-        let err = PluginSettings::from_json(r#"{"timeout_ms":0}"#).unwrap_err();
+        let err = PluginSettings::from_json(r#"{"timeout_ms":0,"grpc":{"cluster":"ext_authz"}}"#)
+            .unwrap_err();
         assert_eq!(err.to_string(), "timeout_ms must be between 1 and 60000");
     }
 
@@ -368,7 +353,10 @@ mod tests {
 
     #[test]
     fn rejects_zero_body_limit() {
-        let err = PluginSettings::from_json(r#"{"request_body":{"max_bytes":0}}"#).unwrap_err();
+        let err = PluginSettings::from_json(
+            r#"{"grpc":{"cluster":"ext_authz"},"request_body":{"max_bytes":0}}"#,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "request_body.max_bytes must be between 1 and 16777216"
@@ -378,7 +366,7 @@ mod tests {
     #[test]
     fn rejects_enabled_cache_with_zero_ttl() {
         let err =
-            PluginSettings::from_json(r#"{"cache":{"enabled":true,"ttl_ms":0,"max_entries":10}}"#)
+            PluginSettings::from_json(r#"{"grpc":{"cluster":"ext_authz"},"cache":{"enabled":true,"ttl_ms":0,"max_entries":10}}"#)
                 .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -389,7 +377,7 @@ mod tests {
     #[test]
     fn rejects_enabled_cache_with_zero_entries() {
         let err = PluginSettings::from_json(
-            r#"{"cache":{"enabled":true,"ttl_ms":1000,"max_entries":0}}"#,
+            r#"{"grpc":{"cluster":"ext_authz"},"cache":{"enabled":true,"ttl_ms":1000,"max_entries":0}}"#,
         )
         .unwrap_err();
         assert_eq!(
@@ -400,9 +388,10 @@ mod tests {
 
     #[test]
     fn rejects_empty_cache_header_name() {
-        let err =
-            PluginSettings::from_json(r#"{"cache":{"headers":{"mode":"denylist","names":[""]}}}"#)
-                .unwrap_err();
+        let err = PluginSettings::from_json(
+            r#"{"grpc":{"cluster":"ext_authz"},"cache":{"headers":{"mode":"denylist","names":[""]}}}"#,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "cache.headers.names must contain non-empty header names"

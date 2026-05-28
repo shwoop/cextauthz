@@ -64,7 +64,11 @@ mod wasm {
     impl RootContext for AuthzRoot {
         fn on_configure(&mut self, plugin_configuration_size: usize) -> bool {
             if plugin_configuration_size == 0 {
-                return true;
+                let _ = proxy_wasm::hostcalls::log(
+                    proxy_wasm::types::LogLevel::Error,
+                    "ext_authz: plugin config must set grpc.cluster",
+                );
+                return false;
             }
             if let Some(config) = self.get_plugin_configuration()
                 && let Ok(text) = std::str::from_utf8(&config)
