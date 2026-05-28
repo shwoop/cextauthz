@@ -154,7 +154,7 @@ mod wasm {
                         match decision {
                             crate::decision::AuthorizationDecision::Allow { request_headers } => {
                                 if self.cache_config.enabled {
-                                    self.store_cache_entry(true, 0);
+                                    self.store_cache_entry(true, 0, "", &[], &request_headers);
                                 }
                                 let _ = proxy_wasm::hostcalls::log(
                                     proxy_wasm::types::LogLevel::Info,
@@ -169,29 +169,16 @@ mod wasm {
                                 headers,
                             } => {
                                 if self.cache_config.enabled {
-                                    self.store_cache_entry(false, status);
+                                    self.store_cache_entry(false, status, &body, &headers, &[]);
                                 }
                                 let _ = proxy_wasm::hostcalls::log(
                                     proxy_wasm::types::LogLevel::Info,
                                     "ext_authz: request denied",
                                 );
 
-                                let mut response_headers: Vec<(&str, &str)> = Vec::new();
-                                if !headers
-                                    .iter()
-                                    .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                                {
-                                    response_headers.push(("content-type", "text/plain"));
-                                }
-                                response_headers.extend(
-                                    headers
-                                        .iter()
-                                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                                );
-
                                 self.send_http_response(
                                     status,
-                                    response_headers,
+                                    local_reply_headers(&headers),
                                     Some(body.as_bytes()),
                                 );
                             }
@@ -354,12 +341,20 @@ mod wasm {
                 if let Some(entry) = self.get_cache_entry(&cache_key) {
                     let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit");
                     if entry.allowed {
+                        let request_headers = cached_headers_to_pairs(&entry.request_headers);
+                        self.apply_request_headers(&request_headers);
                         return Action::Continue;
                     }
+                    let response_headers = cached_headers_to_pairs(&entry.response_headers);
+                    let body = if entry.denied_body.is_empty() {
+                        "Forbidden".to_string()
+                    } else {
+                        entry.denied_body
+                    };
                     self.send_http_response(
                         entry.denied_status,
-                        vec![("content-type", "text/plain")],
-                        Some(b"Forbidden"),
+                        local_reply_headers(&response_headers),
+                        Some(body.as_bytes()),
                     );
                     return Action::Pause;
                 }
@@ -428,7 +423,14 @@ mod wasm {
             Some(entry.clone())
         }
 
-        fn store_cache_entry(&self, allowed: bool, denied_status: u32) {
+        fn store_cache_entry(
+            &self,
+            allowed: bool,
+            denied_status: u32,
+            denied_body: &str,
+            response_headers: &[(String, String)],
+            request_headers: &[(String, String)],
+        ) {
             let Some(cache_key) = self.cache_key.as_deref() else {
                 return;
             };
@@ -449,9 +451,21 @@ mod wasm {
                         expires_at_ms,
                         allowed,
                         denied_status,
-                        denied_body: String::new(),
-                        response_headers: Vec::new(),
-                        request_headers: Vec::new(),
+                        denied_body: denied_body.to_string(),
+                        response_headers: response_headers
+                            .iter()
+                            .map(|(name, value)| crate::cache::CachedHeader {
+                                name: name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                        request_headers: request_headers
+                            .iter()
+                            .map(|(name, value)| crate::cache::CachedHeader {
+                                name: name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
                     },
                 );
                 crate::cache::enforce_quota(&mut shard, quota);
@@ -565,5 +579,28 @@ mod wasm {
                 }
             }
         }
+    }
+
+    fn cached_headers_to_pairs(headers: &[crate::cache::CachedHeader]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect()
+    }
+
+    fn local_reply_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+        let mut response_headers = Vec::new();
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
+            response_headers.push(("content-type", "text/plain"));
+        }
+        response_headers.extend(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        response_headers
     }
 }

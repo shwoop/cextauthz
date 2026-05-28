@@ -200,6 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn cache_entry_can_store_response_effects() {
+        let entry = CacheEntry {
+            expires_at_ms: 1000,
+            allowed: false,
+            denied_status: 401,
+            denied_body: "missing token".to_string(),
+            response_headers: vec![CachedHeader {
+                name: "www-authenticate".to_string(),
+                value: "Bearer".to_string(),
+            }],
+            request_headers: Vec::new(),
+        };
+
+        assert_eq!(entry.denied_body, "missing token");
+        assert_eq!(entry.response_headers[0].name, "www-authenticate");
+        assert_eq!(entry.response_headers[0].value, "Bearer");
+    }
+
+    #[test]
     fn expired_entries_are_removed() {
         let mut shard = CacheShard::default();
         shard.entries.insert(
