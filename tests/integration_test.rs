@@ -1,8 +1,13 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const ENVOY_URL: &str = "http://localhost:10000";
+const INVALIDATION_PATH: &str = "/_cextauthz/cache/invalidate";
+static INTEGRATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct DockerCompose {
     dir: String,
@@ -67,6 +72,11 @@ impl Drop for DockerCompose {
     }
 }
 
+struct TestEnv {
+    compose: DockerCompose,
+    _guard: MutexGuard<'static, ()>,
+}
+
 fn wait_for_envoy(timeout: Duration) -> Result<(), String> {
     let client = reqwest::blocking::Client::new();
     let start = Instant::now();
@@ -107,8 +117,10 @@ fn stop_authz_service(compose: &DockerCompose) {
     compose.run(&["stop", "authz-service"]);
 }
 
-#[test]
-fn test_ext_authz_filter() {
+fn setup_compose() -> TestEnv {
+    let guard = INTEGRATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let wasm_path = "target/wasm32-unknown-unknown/release/cextauthz.wasm";
     assert!(
         std::path::Path::new(wasm_path).exists(),
@@ -118,18 +130,50 @@ fn test_ext_authz_filter() {
 
     assert_port_free(10000);
 
-    let _compose = DockerCompose::new("integration");
-
+    let compose = DockerCompose::new("integration");
     wait_for_envoy(Duration::from_secs(30)).expect("Envoy failed to start");
+    TestEnv {
+        compose,
+        _guard: guard,
+    }
+}
 
-    let client = reqwest::blocking::Client::new();
+fn envoy_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::new()
+}
 
-    // Request without x-ext-authz header should be denied
-    let denied = client
-        .get("http://localhost:10000/")
+fn get_root(
+    client: &reqwest::blocking::Client,
+    authz_value: Option<&str>,
+) -> reqwest::blocking::Response {
+    let mut request = client.get(format!("{ENVOY_URL}/"));
+    if let Some(value) = authz_value {
+        request = request.header("x-ext-authz", value);
+    }
+    request.send().expect("Failed to send request to Envoy")
+}
+
+fn invalidate_all(
+    client: &reqwest::blocking::Client,
+    secret: Option<&str>,
+) -> reqwest::blocking::Response {
+    let mut request = client
+        .post(format!("{ENVOY_URL}{INVALIDATION_PATH}"))
+        .body(r#"{"version":1,"op":"purge_all"}"#);
+    if let Some(secret) = secret {
+        request = request.header("x-cextauthz-invalidation-secret", secret);
+    }
+    request
         .send()
-        .expect("Failed to send request to Envoy");
+        .expect("Failed to send invalidation request to Envoy")
+}
 
+#[test]
+fn cache_hit_survives_authz_outage_until_purge_all() {
+    let env = setup_compose();
+    let client = envoy_client();
+
+    let denied = get_root(&client, None);
     assert_eq!(
         denied.status(),
         403,
@@ -137,13 +181,7 @@ fn test_ext_authz_filter() {
         denied.status()
     );
 
-    // Request with x-ext-authz: allow header should succeed
-    let allowed = client
-        .get("http://localhost:10000/")
-        .header("x-ext-authz", "allow")
-        .send()
-        .expect("Failed to send request to Envoy");
-
+    let allowed = get_root(&client, Some("allow"));
     assert_eq!(
         allowed.status(),
         200,
@@ -151,14 +189,9 @@ fn test_ext_authz_filter() {
         allowed.status()
     );
 
-    stop_authz_service(&_compose);
+    stop_authz_service(&env.compose);
 
-    let cached_allowed = client
-        .get("http://localhost:10000/")
-        .header("x-ext-authz", "allow")
-        .send()
-        .expect("Failed to send cached request to Envoy");
-
+    let cached_allowed = get_root(&client, Some("allow"));
     assert_eq!(
         cached_allowed.status(),
         200,
@@ -166,12 +199,7 @@ fn test_ext_authz_filter() {
         cached_allowed.status()
     );
 
-    let unauthorized_invalidation = client
-        .post("http://localhost:10000/_cextauthz/cache/invalidate")
-        .body(r#"{"version":1,"op":"purge_all"}"#)
-        .send()
-        .expect("Failed to send unauthorized invalidation request to Envoy");
-
+    let unauthorized_invalidation = invalidate_all(&client, None);
     assert_eq!(
         unauthorized_invalidation.status(),
         401,
@@ -179,13 +207,7 @@ fn test_ext_authz_filter() {
         unauthorized_invalidation.status()
     );
 
-    let invalidated = client
-        .post("http://localhost:10000/_cextauthz/cache/invalidate")
-        .header("x-cextauthz-invalidation-secret", "integration-secret")
-        .body(r#"{"version":1,"op":"purge_all"}"#)
-        .send()
-        .expect("Failed to send invalidation request to Envoy");
-
+    let invalidated = invalidate_all(&client, Some("integration-secret"));
     assert_eq!(
         invalidated.status(),
         204,
@@ -193,12 +215,7 @@ fn test_ext_authz_filter() {
         invalidated.status()
     );
 
-    let after_invalidation = client
-        .get("http://localhost:10000/")
-        .header("x-ext-authz", "allow")
-        .send()
-        .expect("Failed to send post-invalidation request to Envoy");
-
+    let after_invalidation = get_root(&client, Some("allow"));
     assert_eq!(
         after_invalidation.status(),
         503,
@@ -209,4 +226,42 @@ fn test_ext_authz_filter() {
     // Note: The authz service adds x-ext-authz-check-received and
     // x-ext-authz-additional-header-override to the upstream request (not the
     // client response) via the gRPC OkResponse. nginx does not echo them back.
+}
+
+#[test]
+fn invalidation_rejects_malformed_json() {
+    let _env = setup_compose();
+    let client = envoy_client();
+
+    let response = client
+        .post(format!("{ENVOY_URL}{INVALIDATION_PATH}"))
+        .header("x-cextauthz-invalidation-secret", "integration-secret")
+        .body("not-json")
+        .send()
+        .expect("Failed to send invalid invalidation request to Envoy");
+
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.text().unwrap(), "invalid json");
+}
+
+#[test]
+fn invalidation_rejects_wrong_secret() {
+    let _env = setup_compose();
+    let client = envoy_client();
+
+    let response = invalidate_all(&client, Some("wrong-secret"));
+
+    assert_eq!(response.status(), 401);
+}
+
+#[test]
+fn denied_responses_are_cached() {
+    let env = setup_compose();
+    let client = envoy_client();
+
+    assert_eq!(get_root(&client, None).status(), 403);
+
+    stop_authz_service(&env.compose);
+
+    assert_eq!(get_root(&client, None).status(), 403);
 }

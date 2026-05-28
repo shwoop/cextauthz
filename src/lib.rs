@@ -1,6 +1,9 @@
 pub mod cache;
+pub mod config;
+pub mod decision;
 pub mod invalidation;
 pub mod pb;
+pub mod request;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -39,61 +42,14 @@ mod wasm {
         body_seen: usize,
     }
 
-    #[derive(serde::Deserialize)]
-    struct PluginConfig {
-        #[serde(default = "default_timeout_ms")]
-        timeout_ms: u64,
-        #[serde(default)]
-        cache: CacheConfigJson,
-        #[serde(default)]
-        invalidation: InvalidationConfigJson,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct CacheConfigJson {
-        #[serde(default)]
-        enabled: bool,
-        #[serde(default = "default_cache_ttl_ms")]
-        ttl_ms: u64,
-        #[serde(default = "default_cache_max_entries")]
-        max_entries: usize,
-    }
-
-    impl Default for CacheConfigJson {
-        fn default() -> Self {
-            Self {
-                enabled: false,
-                ttl_ms: default_cache_ttl_ms(),
-                max_entries: default_cache_max_entries(),
-            }
-        }
-    }
-
-    #[derive(Default, serde::Deserialize)]
-    struct InvalidationConfigJson {
-        #[serde(default)]
-        secret: String,
-    }
-
-    fn default_timeout_ms() -> u64 {
-        1000
-    }
-
-    fn default_cache_ttl_ms() -> u64 {
-        60_000
-    }
-
-    fn default_cache_max_entries() -> usize {
-        1000
-    }
-
     proxy_wasm::main! {{
         proxy_wasm::set_log_level(LogLevel::Info);
         proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+            let settings = crate::config::PluginSettings::default();
             Box::new(AuthzRoot {
-                timeout_ms: default_timeout_ms(),
-                cache_config: crate::cache::CacheConfig::default(),
-                invalidation_secret: String::new(),
+                timeout_ms: settings.timeout_ms,
+                cache_config: settings.cache,
+                invalidation_secret: settings.invalidation_secret,
             })
         });
     }}
@@ -108,14 +64,10 @@ mod wasm {
             if let Some(config) = self.get_plugin_configuration()
                 && let Ok(text) = std::str::from_utf8(&config)
             {
-                if let Ok(config) = serde_json::from_str::<PluginConfig>(text) {
-                    self.timeout_ms = config.timeout_ms;
-                    self.cache_config = crate::cache::CacheConfig {
-                        enabled: config.cache.enabled,
-                        ttl: Duration::from_millis(config.cache.ttl_ms),
-                        max_entries: config.cache.max_entries,
-                    };
-                    self.invalidation_secret = config.invalidation.secret;
+                if let Ok(settings) = crate::config::PluginSettings::from_json(text) {
+                    self.timeout_ms = settings.timeout_ms;
+                    self.cache_config = settings.cache;
+                    self.invalidation_secret = settings.invalidation_secret;
                     let _ = proxy_wasm::hostcalls::log(
                         proxy_wasm::types::LogLevel::Info,
                         &format!(
@@ -187,23 +139,14 @@ mod wasm {
             if let Some(body) = self.get_grpc_call_response_body(0, response_size) {
                 match crate::pb::CheckResponse::decode(&body[..]) {
                     Ok(resp) => {
-                        let allowed = matches!(
-                            resp.http_response.as_ref(),
-                            Some(crate::pb::check_response::HttpResponse::OkResponse(_))
-                        );
-                        let denied_status = resp
-                            .http_response
-                            .as_ref()
-                            .and_then(|r| {
-                                if let crate::pb::check_response::HttpResponse::DeniedResponse(d) =
-                                    r
-                                {
-                                    d.status.as_ref().map(|s| s.code as u32)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(403);
+                        let decision =
+                            crate::decision::AuthorizationDecision::from_check_response(&resp);
+                        let allowed =
+                            matches!(decision, crate::decision::AuthorizationDecision::Allow);
+                        let denied_status = match decision {
+                            crate::decision::AuthorizationDecision::Allow => 0,
+                            crate::decision::AuthorizationDecision::Deny { status } => status,
+                        };
 
                         if self.cache_config.enabled {
                             self.store_cache_entry(allowed, denied_status);
@@ -337,29 +280,17 @@ mod wasm {
         fn dispatch_check_request(&mut self) -> Action {
             self.dispatched = true;
 
-            let check_req = crate::pb::CheckRequest {
-                attributes: Some(crate::pb::AttributeContext {
-                    source: None,
-                    destination: None,
-                    request: Some(crate::pb::Request {
-                        http: Some(crate::pb::HttpRequest {
-                            id: std::mem::take(&mut self.request_id),
-                            method: std::mem::take(&mut self.method),
-                            headers: std::mem::take(&mut self.headers),
-                            path: std::mem::take(&mut self.path),
-                            host: std::mem::take(&mut self.host),
-                            scheme: std::mem::take(&mut self.scheme),
-                            query: std::mem::take(&mut self.query),
-                            fragment: String::new(),
-                            size: self.body_buf.len() as i64,
-                            protocol: String::new(),
-                            body: String::from_utf8_lossy(&self.body_buf).to_string(),
-                            raw_body: std::mem::take(&mut self.body_buf),
-                        }),
-                    }),
-                    context_extensions: HashMap::new(),
-                }),
-            };
+            let check_req = crate::request::RequestParts {
+                method: std::mem::take(&mut self.method),
+                path: std::mem::take(&mut self.path),
+                query: std::mem::take(&mut self.query),
+                host: std::mem::take(&mut self.host),
+                scheme: std::mem::take(&mut self.scheme),
+                request_id: std::mem::take(&mut self.request_id),
+                headers: std::mem::take(&mut self.headers),
+                body: std::mem::take(&mut self.body_buf),
+            }
+            .into_check_request();
 
             if self.cache_config.enabled {
                 let cache_key = crate::cache::compute_cache_key(&check_req);
