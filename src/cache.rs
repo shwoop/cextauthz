@@ -6,7 +6,7 @@ use std::time::Duration;
 
 pub const NUM_SHARDS: usize = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CacheConfig {
     pub enabled: bool,
     pub ttl: Duration,
