@@ -293,7 +293,8 @@ mod wasm {
             .into_check_request();
 
             if self.cache_config.enabled {
-                let cache_key = crate::cache::compute_cache_key(&check_req);
+                let cache_key =
+                    crate::cache::compute_cache_key(&check_req, &self.cache_config.header_policy);
                 self.cache_key = Some(cache_key.clone());
 
                 if let Some(entry) = self.get_cache_entry(&cache_key) {
@@ -393,6 +394,9 @@ mod wasm {
                         expires_at_ms,
                         allowed,
                         denied_status,
+                        denied_body: String::new(),
+                        response_headers: Vec::new(),
+                        request_headers: Vec::new(),
                     },
                 );
                 crate::cache::enforce_quota(&mut shard, quota);

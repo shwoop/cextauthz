@@ -33,6 +33,14 @@ impl Default for CacheConfig {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct CachedHeader {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct CacheEntry {
     #[prost(uint64, tag = "1")]
     pub expires_at_ms: u64,
@@ -40,6 +48,12 @@ pub struct CacheEntry {
     pub allowed: bool,
     #[prost(uint32, tag = "3")]
     pub denied_status: u32,
+    #[prost(string, tag = "4")]
+    pub denied_body: String,
+    #[prost(message, repeated, tag = "5")]
+    pub response_headers: Vec<CachedHeader>,
+    #[prost(message, repeated, tag = "6")]
+    pub request_headers: Vec<CachedHeader>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -55,11 +69,14 @@ struct CacheKeyInput<'a> {
     host: &'a str,
     scheme: &'a str,
     query: &'a str,
-    headers: Vec<(&'a str, &'a str)>,
+    headers: Vec<(String, &'a str)>,
     body_fingerprint: u64,
 }
 
-pub fn compute_cache_key(req: &crate::pb::CheckRequest) -> String {
+pub fn compute_cache_key(
+    req: &crate::pb::CheckRequest,
+    header_policy: &CacheHeaderPolicy,
+) -> String {
     let http = req
         .attributes
         .as_ref()
@@ -68,18 +85,19 @@ pub fn compute_cache_key(req: &crate::pb::CheckRequest) -> String {
 
     let (method, path, host, scheme, query, headers, body_fingerprint) = match http {
         Some(h) => {
-            let mut headers: Vec<(&str, &str)> = h
+            let mut headers: Vec<(String, &str)> = h
                 .headers
                 .iter()
                 .filter_map(|(name, value)| {
-                    if name.eq_ignore_ascii_case("x-request-id") {
-                        None
+                    let name = name.to_ascii_lowercase();
+                    if include_header(&name, header_policy) {
+                        Some((name, value.as_str()))
                     } else {
-                        Some((name.as_str(), value.as_str()))
+                        None
                     }
                 })
                 .collect();
-            headers.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+            headers.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
 
             let mut body_hasher = DefaultHasher::new();
             h.raw_body.hash(&mut body_hasher);
@@ -112,6 +130,16 @@ pub fn compute_cache_key(req: &crate::pb::CheckRequest) -> String {
     format!("cache:{:016x}", hasher.finish())
 }
 
+fn include_header(name: &str, policy: &CacheHeaderPolicy) -> bool {
+    match policy {
+        CacheHeaderPolicy::AllExceptRequestId => !name.eq_ignore_ascii_case("x-request-id"),
+        CacheHeaderPolicy::Allowlist(names) => names.iter().any(|allowed| allowed == name),
+        CacheHeaderPolicy::Denylist(names) => {
+            !name.eq_ignore_ascii_case("x-request-id") && !names.iter().any(|denied| denied == name)
+        }
+    }
+}
+
 pub fn shard_id_from_key(key: &str) -> usize {
     key.strip_prefix("cache:")
         .and_then(|hash| u64::from_str_radix(hash, 16).ok())
@@ -141,7 +169,17 @@ pub fn evict_expired(shard: &mut CacheShard, now_ms: u64) {
 
 pub fn enforce_quota(shard: &mut CacheShard, quota: usize) {
     while shard.entries.len() > quota {
-        let Some(key) = shard.entries.keys().next().cloned() else {
+        let Some(key) = shard
+            .entries
+            .iter()
+            .min_by(|(left_key, left_entry), (right_key, right_entry)| {
+                left_entry
+                    .expires_at_ms
+                    .cmp(&right_entry.expires_at_ms)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _entry)| key.clone())
+        else {
             break;
         };
         shard.entries.remove(&key);
@@ -170,6 +208,9 @@ mod tests {
                 expires_at_ms: 100,
                 allowed: true,
                 denied_status: 0,
+                denied_body: String::new(),
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
             },
         );
         shard.entries.insert(
@@ -178,6 +219,9 @@ mod tests {
                 expires_at_ms: 200,
                 allowed: false,
                 denied_status: 403,
+                denied_body: String::new(),
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
             },
         );
 
@@ -196,7 +240,99 @@ mod tests {
         let mut headers_b = headers_a.clone();
         headers_b.insert("x-request-id".to_string(), "b".to_string());
 
-        let request = |headers| crate::pb::CheckRequest {
+        assert_eq!(
+            compute_cache_key(
+                &request_with_headers(headers_a),
+                &CacheHeaderPolicy::AllExceptRequestId
+            ),
+            compute_cache_key(
+                &request_with_headers(headers_b),
+                &CacheHeaderPolicy::AllExceptRequestId
+            )
+        );
+    }
+
+    #[test]
+    fn key_uses_allowlisted_headers_only() {
+        let mut headers_a = HashMap::new();
+        headers_a.insert("authorization".to_string(), "Bearer a".to_string());
+        headers_a.insert("user-agent".to_string(), "agent-a".to_string());
+
+        let mut headers_b = headers_a.clone();
+        headers_b.insert("user-agent".to_string(), "agent-b".to_string());
+
+        let policy = CacheHeaderPolicy::Allowlist(vec!["authorization".to_string()]);
+
+        assert_eq!(
+            compute_cache_key(&request_with_headers(headers_a), &policy),
+            compute_cache_key(&request_with_headers(headers_b), &policy)
+        );
+    }
+
+    #[test]
+    fn key_uses_denylist_to_ignore_volatile_headers() {
+        let mut headers_a = HashMap::new();
+        headers_a.insert("authorization".to_string(), "Bearer a".to_string());
+        headers_a.insert("traceparent".to_string(), "trace-a".to_string());
+
+        let mut headers_b = headers_a.clone();
+        headers_b.insert("traceparent".to_string(), "trace-b".to_string());
+
+        let policy = CacheHeaderPolicy::Denylist(vec!["traceparent".to_string()]);
+
+        assert_eq!(
+            compute_cache_key(&request_with_headers(headers_a), &policy),
+            compute_cache_key(&request_with_headers(headers_b), &policy)
+        );
+    }
+
+    #[test]
+    fn quota_evicts_nearest_expiry_then_key_order() {
+        let mut shard = CacheShard::default();
+        shard.entries.insert(
+            "cache:b".to_string(),
+            CacheEntry {
+                expires_at_ms: 200,
+                allowed: true,
+                denied_status: 0,
+                denied_body: String::new(),
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
+            },
+        );
+        shard.entries.insert(
+            "cache:a".to_string(),
+            CacheEntry {
+                expires_at_ms: 100,
+                allowed: true,
+                denied_status: 0,
+                denied_body: String::new(),
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
+            },
+        );
+        shard.entries.insert(
+            "cache:c".to_string(),
+            CacheEntry {
+                expires_at_ms: 200,
+                allowed: true,
+                denied_status: 0,
+                denied_body: String::new(),
+                response_headers: Vec::new(),
+                request_headers: Vec::new(),
+            },
+        );
+
+        enforce_quota(&mut shard, 1);
+
+        assert_eq!(
+            shard.entries.keys().cloned().collect::<Vec<_>>(),
+            vec!["cache:c"]
+        );
+    }
+
+    fn request_with_headers(headers: HashMap<String, String>) -> crate::pb::CheckRequest {
+        crate::pb::CheckRequest {
             attributes: Some(crate::pb::AttributeContext {
                 source: None,
                 destination: None,
@@ -218,11 +354,6 @@ mod tests {
                 }),
                 context_extensions: HashMap::new(),
             }),
-        };
-
-        assert_eq!(
-            compute_cache_key(&request(headers_a)),
-            compute_cache_key(&request(headers_b))
-        );
+        }
     }
 }
