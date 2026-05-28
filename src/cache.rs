@@ -11,6 +11,14 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub ttl: Duration,
     pub max_entries: usize,
+    pub header_policy: CacheHeaderPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CacheHeaderPolicy {
+    AllExceptRequestId,
+    Allowlist(Vec<String>),
+    Denylist(Vec<String>),
 }
 
 impl Default for CacheConfig {
@@ -19,6 +27,7 @@ impl Default for CacheConfig {
             enabled: false,
             ttl: Duration::from_secs(60),
             max_entries: 1000,
+            header_policy: CacheHeaderPolicy::AllExceptRequestId,
         }
     }
 }
