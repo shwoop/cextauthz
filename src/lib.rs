@@ -69,25 +69,37 @@ mod wasm {
             if let Some(config) = self.get_plugin_configuration()
                 && let Ok(text) = std::str::from_utf8(&config)
             {
-                if let Ok(settings) = crate::config::PluginSettings::from_json(text) {
-                    self.timeout_ms = settings.timeout_ms;
-                    self.grpc_cluster = settings.grpc_cluster;
-                    self.max_request_body_bytes = settings.max_request_body_bytes;
-                    self.cache_config = settings.cache;
-                    self.invalidation_secret = settings.invalidation_secret;
-                    let _ = proxy_wasm::hostcalls::log(
-                        proxy_wasm::types::LogLevel::Info,
-                        &format!(
-                            "ext_authz: configured timeout={}ms cache_enabled={} max_request_body_bytes={}",
-                            self.timeout_ms, self.cache_config.enabled, self.max_request_body_bytes
-                        ),
-                    );
-                } else {
-                    let _ = proxy_wasm::hostcalls::log(
-                        proxy_wasm::types::LogLevel::Warn,
-                        "ext_authz: plugin config is not valid JSON; using defaults",
-                    );
+                match crate::config::PluginSettings::from_json(text) {
+                    Ok(settings) => {
+                        self.timeout_ms = settings.timeout_ms;
+                        self.grpc_cluster = settings.grpc_cluster;
+                        self.max_request_body_bytes = settings.max_request_body_bytes;
+                        self.cache_config = settings.cache;
+                        self.invalidation_secret = settings.invalidation_secret;
+                        let _ = proxy_wasm::hostcalls::log(
+                            proxy_wasm::types::LogLevel::Info,
+                            &format!(
+                                "ext_authz: configured timeout={}ms cache_enabled={} max_request_body_bytes={}",
+                                self.timeout_ms,
+                                self.cache_config.enabled,
+                                self.max_request_body_bytes
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        let _ = proxy_wasm::hostcalls::log(
+                            proxy_wasm::types::LogLevel::Error,
+                            &format!("ext_authz: plugin config rejected: {err}"),
+                        );
+                        return false;
+                    }
                 }
+            } else {
+                let _ = proxy_wasm::hostcalls::log(
+                    proxy_wasm::types::LogLevel::Error,
+                    "ext_authz: plugin config is not valid UTF-8",
+                );
+                return false;
             }
             true
         }
