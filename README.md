@@ -36,10 +36,20 @@ optional.
 ```json
 {
   "timeout_ms": 1000,
+  "grpc": {
+    "cluster": "ext_authz"
+  },
+  "request_body": {
+    "max_bytes": 1048576
+  },
   "cache": {
     "enabled": true,
     "ttl_ms": 60000,
-    "max_entries": 1000
+    "max_entries": 1000,
+    "headers": {
+      "mode": "all_except_request_id",
+      "names": []
+    }
   },
   "invalidation": {
     "secret": "integration-secret"
@@ -52,14 +62,33 @@ Defaults:
 | Field | Default | Description |
 | --- | --- | --- |
 | `timeout_ms` | `1000` | gRPC authorization call timeout in milliseconds |
+| `grpc.cluster` | `"ext_authz"` | Envoy cluster used for the ext_authz gRPC call |
+| `request_body.max_bytes` | `1048576` | maximum buffered request body bytes before returning `413` |
 | `cache.enabled` | `false` | enables shared-data decision caching |
 | `cache.ttl_ms` | `60000` | cache entry TTL in milliseconds |
 | `cache.max_entries` | `1000` | approximate maximum cache entries across shards |
+| `cache.headers.mode` | `"all_except_request_id"` | header policy for cache-key construction: `all_except_request_id`, `allowlist`, or `denylist` |
+| `cache.headers.names` | `[]` | header names used by `allowlist` or `denylist`; names are normalized to lowercase |
 | `invalidation.secret` | `""` | required secret for cache invalidation requests |
 
 Cache keys include method, path, host, scheme, query, headers, and request body.
 The `x-request-id` header is ignored so otherwise identical requests can share a
-decision.
+decision when `cache.headers.mode` is `all_except_request_id`. Use `allowlist`
+or `denylist` when only specific headers can affect authorization decisions, or
+when volatile headers would reduce cache hit rates.
+
+Configuration validation rejects:
+
+- `timeout_ms = 0` or values above `60000`
+- empty `grpc.cluster`
+- `request_body.max_bytes = 0` or values above `16777216`
+- enabled cache with `ttl_ms = 0`, `ttl_ms > 86400000`, or `max_entries = 0`
+- empty cache header names
+
+Request bodies larger than `request_body.max_bytes` fail closed with `413
+Payload Too Large`. Denied ext_authz responses propagate the returned HTTP
+status, body, and response headers. Allowed ext_authz responses apply returned
+request-header additions before forwarding upstream.
 
 ## Cache Invalidation
 
@@ -161,7 +190,7 @@ The stack runs:
 
 - Envoy on `http://localhost:10000`
 - nginx as the upstream service
-- `registry.istio.io/testing/ext-authz:latest` as the authz service
+- `istio/ext-authz:1.30.0-debug` as the authz service
 
 Example denied request:
 
@@ -214,10 +243,17 @@ spec:
       failOpen: false
       config:
         timeout_ms: 1000
+        grpc:
+          cluster: ext_authz
+        request_body:
+          max_bytes: 1048576
         cache:
           enabled: true
           ttl_ms: 60000
           max_entries: 1000
+          headers:
+            mode: all_except_request_id
+            names: []
         invalidation:
           secret: change-me
       code:
@@ -231,13 +267,12 @@ Pin the release version and set `sha256` for production deployments. Without
 `sha256`, Envoy Gateway can still fetch the module, but it will not verify the
 downloaded WASM bytes.
 
-This filter currently dispatches authorization checks to a hardcoded Envoy
-cluster named `ext_authz`. The local Docker fixture creates that cluster in
-`integration/envoy.yaml`, but Envoy Gateway will not create it automatically
-from the `EnvoyExtensionPolicy`. For Envoy Gateway deployments, either add an
-`EnvoyPatchPolicy` that creates an Envoy cluster named `ext_authz` for your
-authorization service, or update this filter to make the cluster name
-configurable.
+This filter dispatches authorization checks to the Envoy cluster configured by
+`grpc.cluster`, which defaults to `ext_authz`. The local Docker fixture creates
+that cluster in `integration/envoy.yaml`, but Envoy Gateway will not create it
+automatically from the `EnvoyExtensionPolicy`. For Envoy Gateway deployments,
+add an `EnvoyPatchPolicy` or other Envoy configuration that creates the cluster
+named by `grpc.cluster` for your authorization service.
 
 Envoy Gateway also supports packaging the WASM module as an OCI image and using
 `code.type: Image` instead of an HTTP URL.
