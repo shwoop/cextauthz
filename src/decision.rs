@@ -18,7 +18,11 @@ impl AuthorizationDecision {
             },
             Some(crate::pb::check_response::HttpResponse::DeniedResponse(denied))
             | Some(crate::pb::check_response::HttpResponse::ErrorResponse(denied)) => Self::Deny {
-                status: denied.status.as_ref().map(|s| s.code as u32).unwrap_or(403),
+                status: denied
+                    .status
+                    .as_ref()
+                    .map(|s| valid_http_status_or_forbidden(s.code))
+                    .unwrap_or(403),
                 body: if denied.body.is_empty() {
                     "Forbidden".to_string()
                 } else {
@@ -32,6 +36,14 @@ impl AuthorizationDecision {
                 headers: Vec::new(),
             },
         }
+    }
+}
+
+fn valid_http_status_or_forbidden(status: i32) -> u32 {
+    if (100..=599).contains(&status) {
+        status as u32
+    } else {
+        403
     }
 }
 
@@ -140,6 +152,31 @@ mod tests {
                 headers: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn defaults_invalid_denied_status_to_forbidden() {
+        for status_code in [-1, 0, 99, 600] {
+            let response = crate::pb::CheckResponse {
+                status: None,
+                http_response: Some(crate::pb::check_response::HttpResponse::DeniedResponse(
+                    crate::pb::DeniedHttpResponse {
+                        status: Some(crate::pb::HttpStatus { code: status_code }),
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                )),
+            };
+
+            assert_eq!(
+                AuthorizationDecision::from_check_response(&response),
+                AuthorizationDecision::Deny {
+                    status: 403,
+                    body: "Forbidden".to_string(),
+                    headers: Vec::new(),
+                }
+            );
+        }
     }
 
     #[test]
