@@ -1,6 +1,7 @@
 use prost::Message;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
@@ -41,6 +42,33 @@ pub struct CachedHeader {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct CachedRequestHeaderMutation {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+    #[prost(
+        enumeration = "cached_request_header_mutation::HeaderMutationAction",
+        tag = "3"
+    )]
+    pub action: i32,
+}
+
+pub mod cached_request_header_mutation {
+    use prost::Enumeration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+    #[repr(i32)]
+    pub enum HeaderMutationAction {
+        AppendIfExistsOrAdd = 0,
+        AddIfAbsent = 1,
+        OverwriteIfExistsOrAdd = 2,
+        OverwriteIfExists = 3,
+        Remove = 4,
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct CacheEntry {
     #[prost(uint64, tag = "1")]
     pub expires_at_ms: u64,
@@ -53,7 +81,7 @@ pub struct CacheEntry {
     #[prost(message, repeated, tag = "5")]
     pub response_headers: Vec<CachedHeader>,
     #[prost(message, repeated, tag = "6")]
-    pub request_headers: Vec<CachedHeader>,
+    pub request_header_mutations: Vec<CachedRequestHeaderMutation>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -186,6 +214,96 @@ pub fn enforce_quota(shard: &mut CacheShard, quota: usize) {
     }
 }
 
+impl From<&crate::decision::RequestHeaderMutation> for CachedRequestHeaderMutation {
+    fn from(value: &crate::decision::RequestHeaderMutation) -> Self {
+        match value {
+            crate::decision::RequestHeaderMutation::AppendIfExistsOrAdd { name, value } => Self {
+                name: name.clone(),
+                value: value.clone(),
+                action: cached_request_header_mutation::HeaderMutationAction::AppendIfExistsOrAdd
+                    as i32,
+            },
+            crate::decision::RequestHeaderMutation::AddIfAbsent { name, value } => Self {
+                name: name.clone(),
+                value: value.clone(),
+                action: cached_request_header_mutation::HeaderMutationAction::AddIfAbsent as i32,
+            },
+            crate::decision::RequestHeaderMutation::OverwriteIfExistsOrAdd { name, value } => {
+                Self {
+                    name: name.clone(),
+                    value: value.clone(),
+                    action:
+                        cached_request_header_mutation::HeaderMutationAction::OverwriteIfExistsOrAdd
+                            as i32,
+                }
+            }
+            crate::decision::RequestHeaderMutation::OverwriteIfExists { name, value } => Self {
+                name: name.clone(),
+                value: value.clone(),
+                action: cached_request_header_mutation::HeaderMutationAction::OverwriteIfExists
+                    as i32,
+            },
+            crate::decision::RequestHeaderMutation::Remove { name } => Self {
+                name: name.clone(),
+                value: String::new(),
+                action: cached_request_header_mutation::HeaderMutationAction::Remove as i32,
+            },
+        }
+    }
+}
+
+impl TryFrom<&CachedRequestHeaderMutation> for crate::decision::RequestHeaderMutation {
+    type Error = ();
+
+    fn try_from(value: &CachedRequestHeaderMutation) -> Result<Self, Self::Error> {
+        match value.action {
+            x if x
+                == cached_request_header_mutation::HeaderMutationAction::AppendIfExistsOrAdd
+                    as i32 =>
+            {
+                Ok(
+                    crate::decision::RequestHeaderMutation::AppendIfExistsOrAdd {
+                        name: value.name.clone(),
+                        value: value.value.clone(),
+                    },
+                )
+            }
+            x if x == cached_request_header_mutation::HeaderMutationAction::AddIfAbsent as i32 => {
+                Ok(crate::decision::RequestHeaderMutation::AddIfAbsent {
+                    name: value.name.clone(),
+                    value: value.value.clone(),
+                })
+            }
+            x if x
+                == cached_request_header_mutation::HeaderMutationAction::OverwriteIfExistsOrAdd
+                    as i32 =>
+            {
+                Ok(
+                    crate::decision::RequestHeaderMutation::OverwriteIfExistsOrAdd {
+                        name: value.name.clone(),
+                        value: value.value.clone(),
+                    },
+                )
+            }
+            x if x
+                == cached_request_header_mutation::HeaderMutationAction::OverwriteIfExists
+                    as i32 =>
+            {
+                Ok(crate::decision::RequestHeaderMutation::OverwriteIfExists {
+                    name: value.name.clone(),
+                    value: value.value.clone(),
+                })
+            }
+            x if x == cached_request_header_mutation::HeaderMutationAction::Remove as i32 => {
+                Ok(crate::decision::RequestHeaderMutation::Remove {
+                    name: value.name.clone(),
+                })
+            }
+            _ => Err(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +328,7 @@ mod tests {
                 name: "www-authenticate".to_string(),
                 value: "Bearer".to_string(),
             }],
-            request_headers: Vec::new(),
+            request_header_mutations: Vec::new(),
         };
 
         assert_eq!(entry.denied_body, "missing token");
@@ -229,7 +347,7 @@ mod tests {
                 denied_status: 0,
                 denied_body: String::new(),
                 response_headers: Vec::new(),
-                request_headers: Vec::new(),
+                request_header_mutations: Vec::new(),
             },
         );
         shard.entries.insert(
@@ -240,7 +358,7 @@ mod tests {
                 denied_status: 403,
                 denied_body: String::new(),
                 response_headers: Vec::new(),
-                request_headers: Vec::new(),
+                request_header_mutations: Vec::new(),
             },
         );
 
@@ -316,7 +434,7 @@ mod tests {
                 denied_status: 0,
                 denied_body: String::new(),
                 response_headers: Vec::new(),
-                request_headers: Vec::new(),
+                request_header_mutations: Vec::new(),
             },
         );
         shard.entries.insert(
@@ -327,7 +445,7 @@ mod tests {
                 denied_status: 0,
                 denied_body: String::new(),
                 response_headers: Vec::new(),
-                request_headers: Vec::new(),
+                request_header_mutations: Vec::new(),
             },
         );
         shard.entries.insert(
@@ -338,7 +456,7 @@ mod tests {
                 denied_status: 0,
                 denied_body: String::new(),
                 response_headers: Vec::new(),
-                request_headers: Vec::new(),
+                request_header_mutations: Vec::new(),
             },
         );
 

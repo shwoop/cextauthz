@@ -163,15 +163,23 @@ mod wasm {
                         let decision =
                             crate::decision::AuthorizationDecision::from_check_response(&resp);
                         match decision {
-                            crate::decision::AuthorizationDecision::Allow { request_headers } => {
+                            crate::decision::AuthorizationDecision::Allow {
+                                request_header_mutations,
+                            } => {
                                 if self.cache_config.enabled {
-                                    self.store_cache_entry(true, 0, "", &[], &request_headers);
+                                    self.store_cache_entry(
+                                        true,
+                                        0,
+                                        "",
+                                        &[],
+                                        &request_header_mutations,
+                                    );
                                 }
                                 let _ = proxy_wasm::hostcalls::log(
                                     proxy_wasm::types::LogLevel::Info,
                                     "ext_authz: request allowed",
                                 );
-                                self.apply_request_headers(&request_headers);
+                                self.apply_request_header_mutations(&request_header_mutations);
                                 self.resume_http_request();
                             }
                             crate::decision::AuthorizationDecision::Deny {
@@ -352,8 +360,11 @@ mod wasm {
                 if let Some(entry) = self.get_cache_entry(&cache_key) {
                     let _ = proxy_wasm::hostcalls::log(LogLevel::Info, "ext_authz: cache hit");
                     if entry.allowed {
-                        let request_headers = cached_headers_to_pairs(&entry.request_headers);
-                        self.apply_request_headers(&request_headers);
+                        let request_header_mutations =
+                            cached_request_header_mutations_to_request_header_mutations(
+                                &entry.request_header_mutations,
+                            );
+                        self.apply_request_header_mutations(&request_header_mutations);
                         return Action::Continue;
                     }
                     let response_headers = cached_headers_to_pairs(&entry.response_headers);
@@ -439,7 +450,7 @@ mod wasm {
             denied_status: u32,
             denied_body: &str,
             response_headers: &[(String, String)],
-            request_headers: &[(String, String)],
+            request_header_mutations: &[crate::decision::RequestHeaderMutation],
         ) {
             let Some(cache_key) = self.cache_key.as_deref() else {
                 return;
@@ -469,12 +480,9 @@ mod wasm {
                                 value: value.clone(),
                             })
                             .collect(),
-                        request_headers: request_headers
+                        request_header_mutations: request_header_mutations
                             .iter()
-                            .map(|(name, value)| crate::cache::CachedHeader {
-                                name: name.clone(),
-                                value: value.clone(),
-                            })
+                            .map(crate::cache::CachedRequestHeaderMutation::from)
                             .collect(),
                     },
                 );
@@ -493,9 +501,40 @@ mod wasm {
             }
         }
 
-        fn apply_request_headers(&self, headers: &[(String, String)]) {
-            for (name, value) in headers {
-                self.set_http_request_header(name, Some(value));
+        fn apply_request_header_mutations(
+            &self,
+            mutations: &[crate::decision::RequestHeaderMutation],
+        ) {
+            for mutation in mutations {
+                match mutation {
+                    crate::decision::RequestHeaderMutation::AppendIfExistsOrAdd { name, value } => {
+                        self.add_http_request_header(name, value);
+                    }
+                    crate::decision::RequestHeaderMutation::AddIfAbsent { name, value } => {
+                        if self.get_http_request_header(name).is_none() {
+                            self.add_http_request_header(name, value);
+                        }
+                    }
+                    crate::decision::RequestHeaderMutation::OverwriteIfExistsOrAdd {
+                        name,
+                        value,
+                    } => {
+                        self.set_http_request_header(name, Some(value));
+                    }
+                    crate::decision::RequestHeaderMutation::OverwriteIfExists { name, value } => {
+                        if self.get_http_request_header(name).is_some() {
+                            self.set_http_request_header(name, Some(value));
+                        }
+                    }
+                    crate::decision::RequestHeaderMutation::Remove { name } => {
+                        if !name.is_empty()
+                            && !name.starts_with(':')
+                            && !name.eq_ignore_ascii_case("host")
+                        {
+                            self.remove_http_request_header(name);
+                        }
+                    }
+                }
             }
         }
 
@@ -595,6 +634,15 @@ mod wasm {
         headers
             .iter()
             .map(|header| (header.name.clone(), header.value.clone()))
+            .collect()
+    }
+
+    fn cached_request_header_mutations_to_request_header_mutations(
+        mutations: &[crate::cache::CachedRequestHeaderMutation],
+    ) -> Vec<crate::decision::RequestHeaderMutation> {
+        mutations
+            .iter()
+            .filter_map(|mutation| std::convert::TryFrom::try_from(mutation).ok())
             .collect()
     }
 
